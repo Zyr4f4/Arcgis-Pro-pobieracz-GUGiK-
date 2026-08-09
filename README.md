@@ -17,14 +17,14 @@ Aby dodać toolboxa do projektu należy w panelu katalog kliknąć PPM na Tolbox
 --------------------------------------------------------
 ## <b>ZAWARTOSĆ PRZYBORNIKA</b>
 
-### <b>1. Pobierz geometrię z ULDK</b>
+### <b>1. Pobierz obrys działek/obrębów/gmin/powiatów/województw (ULDK)</b>
   
 Dostępne są trzy metody wyboru obiektów:
 - Kliknięcie na mapie
 - Wybór wg numeru TERYT
 - Kaskadowy wybór z listy (Województwo -> Powiat -> Gmina -> Obręb)
 
-<img width="763" height="521" alt="image" src="https://github.com/user-attachments/assets/28042358-d8f6-4a4e-b3dd-63a012e20c66" />
+<img width="765" height="521" alt="image" src="https://github.com/user-attachments/assets/5f9cf0ab-33e9-4d03-ba8e-bcc66b07c60f" />
 
 Do prawidłowego działania listy kaskadowej niezbędne jest umieszczenie w tym samym folderze pliku .json ze słownikiem. W razie potrzeby jego aktualizacji, można to zrobić za pomocą dołączonego skryptu.
 
@@ -41,7 +41,8 @@ Pozwala na pobieranie ortofotomapy wg następujących kryteriów:
 - wielkość piksela
 - stopień wypełnienia arkusza
 
-  Dodatkowo po pobraniu można utworzyć mozaikę z pobranych materiałów i obliczyć jej statystyki.
+  Zaznaczenie wszystkich lat skorowidzów pozwala na pobranie wszystkich materiałów dla wybranego obszaru.
+  Po pobraniu można utworzyć mozaikę z pobranych materiałów i obliczyć jej statystyki.
   
 <img width="774" height="836" alt="image" src="https://github.com/user-attachments/assets/332556f5-7b96-4293-9e6d-ccba8cd45750" />
 
