@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import arcpy
 import urllib.request
 import urllib.parse
@@ -21,7 +22,7 @@ def load_teryt_db():
             except NameError:
                 import inspect
                 base_dir = os.path.dirname(os.path.abspath(inspect.getfile(inspect.currentframe())))
-                
+
             db_path = os.path.join(base_dir, "slownik_teryt.json")
             if os.path.exists(db_path):
                 with open(db_path, 'r', encoding='utf-8') as f:
@@ -32,16 +33,161 @@ def load_teryt_db():
             TERYT_DB = False
     return TERYT_DB
 
+# ==============================================================================
+# DEDYKOWANE KLASY POMOCNICZE HTTP ORAZ WFS
+# ==============================================================================
+class HttpClient:
+    """Klasa odpowiedzialna za bezpieczne połączenia HTTPS, timeouty oraz pobieranie."""
+
+    DEFAULT_TIMEOUT = 60
+    DEFAULT_HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ArcGISPro-GUGiKTools/1.0"
+    }
+
+    @classmethod
+    def fetch_bytes(cls, url, headers=None, timeout=None, retries=3, delay=2.0):
+        req_headers = cls.DEFAULT_HEADERS.copy()
+        if headers:
+            req_headers.update(headers)
+        to = timeout or cls.DEFAULT_TIMEOUT
+
+        req = urllib.request.Request(url, headers=req_headers)
+        for attempt in range(retries):
+            try:
+                with urllib.request.urlopen(req, timeout=to) as resp:
+                    return resp.read()
+            except Exception as e:
+                if attempt == retries - 1:
+                    raise e
+                time.sleep(delay)
+
+    @classmethod
+    def fetch_text(cls, url, headers=None, timeout=None, retries=3, delay=2.0, encoding='utf-8'):
+        data = cls.fetch_bytes(url, headers=headers, timeout=timeout, retries=retries, delay=delay)
+        return data.decode(encoding, errors='ignore').strip()
+
+    @classmethod
+    def download_stream(cls, url, out_path, headers=None, timeout=None, retries=3, delay=2.0, chunk_size=128*1024, messages=None):
+        """Pobiera plik częściami (chunk-by-chunk), zapobiegając wyczerpaniu pamięci RAM."""
+        req_headers = cls.DEFAULT_HEADERS.copy()
+        if headers:
+            req_headers.update(headers)
+        to = timeout or cls.DEFAULT_TIMEOUT
+
+        temp_path = out_path + ".tmp"
+        req = urllib.request.Request(url, headers=req_headers)
+
+        for attempt in range(retries):
+            try:
+                with urllib.request.urlopen(req, timeout=to) as resp:
+                    total_size = resp.headers.get('content-length')
+                    total_bytes = int(total_size) if total_size and total_size.isdigit() else None
+                    downloaded = 0
+                    last_reported = 0
+
+                    with open(temp_path, "wb") as f_out:
+                        while True:
+                            chunk = resp.read(chunk_size)
+                            if not chunk:
+                                break
+                            f_out.write(chunk)
+                            downloaded += len(chunk)
+
+                            # Raportuj postęp co 5 MB
+                            if messages and (downloaded - last_reported >= 5 * 1024 * 1024):
+                                mb = downloaded / (1024 * 1024)
+                                if total_bytes:
+                                    pct = int((downloaded / total_bytes) * 100)
+                                    messages.addMessage(f"Pobieranie w toku: {mb:.1f} MB ({pct}%)...")
+                                else:
+                                    messages.addMessage(f"Pobieranie w toku: {mb:.1f} MB...")
+                                last_reported = downloaded
+
+                if os.path.exists(out_path):
+                    os.remove(out_path)
+                os.rename(temp_path, out_path)
+                return out_path
+
+            except Exception as e:
+                if os.path.exists(temp_path):
+                    try:
+                        os.remove(temp_path)
+                    except Exception:
+                        pass
+                if attempt == retries - 1:
+                    raise e
+                time.sleep(delay)
+
+
+class WFSClient:
+    """Klasa obsługująca komunikację z usługami WFS (GetCapabilities, GetFeature)."""
+
+    def __init__(self, http_client=HttpClient):
+        self.http = http_client
+
+    def get_all_typenames(self, base_url):
+        url = f"{base_url}?SERVICE=WFS&REQUEST=GetCapabilities&VERSION=2.0.0"
+        xml_text = self.http.fetch_text(url)
+
+        names = sorted(set(re.findall(
+            r"<(?:\w+:)?Name>([^<]*Skorowidz[^<]*)</(?:\w+:)?Name>",
+            xml_text, re.IGNORECASE
+        )))
+        if not names:
+            raise RuntimeError("Nie znaleziono żadnej warstwy skorowidza w GetCapabilities.")
+
+        def year_of(name):
+            years = re.findall(r"(?:19|20)\d{2}", name)
+            return int(years[-1]) if years else None
+
+        dated = [(year_of(n), n) for n in names]
+        dated.sort(key=lambda t: (t[0] is None, -(t[0] or 0)))
+        return dated
+
+    def get_features(self, base_url, typename, bbox_2180):
+        xmin, ymin, xmax, ymax = bbox_2180
+        bbox_param = f"{ymin},{xmin},{ymax},{xmax},urn:ogc:def:crs:EPSG::2180"
+        url = (
+            f"{base_url}?SERVICE=WFS&REQUEST=GetFeature&VERSION=2.0.0"
+            f"&TYPENAMES={urllib.parse.quote(typename)}"
+            f"&SRSNAME=urn:ogc:def:crs:EPSG::2180&BBOX={bbox_param}"
+        )
+        data = self.http.fetch_bytes(url)
+        root = ET.fromstring(data)
+
+        feature_elems = []
+        for el in root.iter():
+            local = el.tag.split("}")[-1]
+            if local in ("member", "featureMember"):
+                feature_elems.extend(list(el))
+
+        results = []
+        for feat in feature_elems:
+            attrs = {}
+            for child in feat:
+                local = child.tag.split("}")[-1].lower()
+                if child.text and child.text.strip():
+                    attrs[local] = child.text.strip()
+            if attrs:
+                results.append(attrs)
+        return results
+
+# ==============================================================================
+# TOOLBOX
+# ==============================================================================
 class Toolbox(object):
     def __init__(self):
         self.label = "Pobierz dane GUGiK"
         self.alias = "GUGiK_tools"
         self.tools = [PobierzDzialkeULDK, PobierzOrtofotomape, PobierzChmuryPunktow, PobierzNMTNMPT, PobierzSkorowidzEGIB]
 
+# ==============================================================================
+# NARZĘDZIE 1: ULDK
+# ==============================================================================
 class PobierzDzialkeULDK(object):
     def __init__(self):
-        self.label = "Pobierz geometrię z ULDK"
-        self.description = "Pobiera poligony działek, obrębów, gmin, powiatów lub województw."
+        self.label = "Pobierz obrys działek/obrębów/gmin/powiatów/ województw (ULDK)"
+        self.description = "Pobiera poligony działek, obrębów, gmin, powiatów lub województw za pomocą Usługi Lokalizacji Działek Katastralnych."
         self.canRunInBackground = False
 
     def getParameterInfo(self):
@@ -94,7 +240,7 @@ class PobierzDzialkeULDK(object):
             direction="Input"
         )
         param_woj.filter.list = ["(Ładowanie słownika...)"]
-        
+
         param_pow = arcpy.Parameter(
             displayName="Powiat",
             name="powiat",
@@ -103,7 +249,7 @@ class PobierzDzialkeULDK(object):
             direction="Input"
         )
         param_pow.filter.list = ["(Ładowanie słownika...)"]
-        
+
         param_gmi = arcpy.Parameter(
             displayName="Gmina",
             name="gmina",
@@ -112,7 +258,7 @@ class PobierzDzialkeULDK(object):
             direction="Input"
         )
         param_gmi.filter.list = ["(Ładowanie słownika...)"]
-        
+
         param_obr = arcpy.Parameter(
             displayName="Obręb",
             name="obreb",
@@ -121,7 +267,7 @@ class PobierzDzialkeULDK(object):
             direction="Input"
         )
         param_obr.filter.list = ["(Ładowanie słownika...)"]
-        
+
         param_dz_nr = arcpy.Parameter(
             displayName="Arkusz + Numer działki np. AR_6.1/7",
             name="dzialka_nr",
@@ -142,7 +288,7 @@ class PobierzDzialkeULDK(object):
                 param_out_ws.value = arcpy.env.workspace
         except Exception:
             pass
-        
+
         param_out_name = arcpy.Parameter(
             displayName="Nazwa warstwy (istniejącej lub nowej)",
             name="out_name",
@@ -159,7 +305,7 @@ class PobierzDzialkeULDK(object):
             parameterType="Optional",
             direction="Input"
         )
-        param_author.value = "Autor: Mateusz Lubański m.lubanski94@gmail.com"
+        param_author.value = "Autor: Mateusz Lubański"
 
         param_derived = arcpy.Parameter(
             displayName="Wynikowa warstwa (Ukryta)",
@@ -170,14 +316,14 @@ class PobierzDzialkeULDK(object):
         )
 
         return [
-            param_method, param_typ, param_point, param_id, 
-            param_woj, param_pow, param_gmi, param_obr, param_dz_nr, 
+            param_method, param_typ, param_point, param_id,
+            param_woj, param_pow, param_gmi, param_obr, param_dz_nr,
             param_out_ws, param_out_name, param_author, param_derived
         ]
 
     def updateParameters(self, p):
         if not p or not p[0].value: return
-            
+
         method = p[0].valueAsText
         is_click = (method == "Kliknięcie na mapie")
         is_teryt = (method == "Identyfikator TERYT")
@@ -189,7 +335,7 @@ class PobierzDzialkeULDK(object):
         p[5].enabled = is_list
         p[6].enabled = is_list
         p[7].enabled = is_list
-        
+
         p[8].enabled = is_list and p[1].valueAsText == "Działka"
 
         if len(p) > 11:
@@ -203,50 +349,49 @@ class PobierzDzialkeULDK(object):
             else:
                 p[4].clearMessage()
 
+            # Województwa
             woj_list = sorted([f"{v} ({k})" for k, v in db.get("wojewodztwa", {}).items()])
             if p[4].filter.list != woj_list:
                 p[4].filter.list = woj_list
-            if not p[4].valueAsText and woj_list:
-                p[4].value = woj_list[0]
 
             woj_val = p[4].valueAsText
-            woj_id = woj_val.split('(')[-1].replace(')','') if woj_val else None
+            woj_id = woj_val.split('(')[-1].replace(')','') if woj_val and '(' in woj_val else None
 
+            # Powiaty
             pow_list = []
             if woj_id and woj_id in db.get("powiaty", {}):
                 pow_list = sorted([f"{v} ({k})" for k, v in db["powiaty"][woj_id].items()])
 
-            if p[5].filter.list != pow_list and pow_list:
+            if p[5].filter.list != pow_list:
                 p[5].filter.list = pow_list
-                p[5].value = pow_list[0]
-            elif not p[5].valueAsText and pow_list:
-                p[5].value = pow_list[0]
+                if p[5].valueAsText and p[5].valueAsText not in pow_list:
+                    p[5].value = None
 
             pow_val = p[5].valueAsText
-            pow_id = pow_val.split('(')[-1].replace(')','') if pow_val else None
+            pow_id = pow_val.split('(')[-1].replace(')','') if pow_val and '(' in pow_val else None
 
+            # Gminy
             gmi_list = []
             if pow_id and pow_id in db.get("gminy", {}):
                 gmi_list = sorted([f"{v} ({k})" for k, v in db["gminy"][pow_id].items()])
 
-            if p[6].filter.list != gmi_list and gmi_list:
+            if p[6].filter.list != gmi_list:
                 p[6].filter.list = gmi_list
-                p[6].value = gmi_list[0]
-            elif not p[6].valueAsText and gmi_list:
-                p[6].value = gmi_list[0]
+                if p[6].valueAsText and p[6].valueAsText not in gmi_list:
+                    p[6].value = None
 
             gmi_val = p[6].valueAsText
-            gmi_id = gmi_val.split('(')[-1].replace(')','') if gmi_val else None
+            gmi_id = gmi_val.split('(')[-1].replace(')','') if gmi_val and '(' in gmi_val else None
 
+            # Obręby
             obr_list = []
             if gmi_id and gmi_id in db.get("obreby", {}):
                 obr_list = sorted([f"{v} ({k})" for k, v in db["obreby"][gmi_id].items()])
 
-            if p[7].filter.list != obr_list and obr_list:
+            if p[7].filter.list != obr_list:
                 p[7].filter.list = obr_list
-                p[7].value = obr_list[0]
-            elif not p[7].valueAsText and obr_list:
-                p[7].value = obr_list[0]
+                if p[7].valueAsText and p[7].valueAsText not in obr_list:
+                    p[7].value = None
 
     def execute(self, p, messages):
         method = p[0].valueAsText
@@ -369,15 +514,13 @@ class PobierzDzialkeULDK(object):
 
     def fetch_and_insert(self, req_url, cursor, processed_ids, extent, sr_2180, typ_obiektu):
         try:
-            req = urllib.request.Request(req_url)
-            with urllib.request.urlopen(req) as response:
-                resp_text = response.read().decode('utf-8').strip()
+            resp_text = HttpClient.fetch_text(req_url, timeout=30)
         except Exception as e:
             arcpy.AddWarning(f"Błąd sieci: {e}")
             return extent
 
         lines = resp_text.split('\n')
-        if lines[0].strip() != "0" or len(lines) < 2:
+        if not lines or lines[0].strip() != "0" or len(lines) < 2:
             return extent
 
         for data_line in lines[1:]:
@@ -418,14 +561,10 @@ class PobierzDzialkeULDK(object):
                 arcpy.AddWarning(f"Błąd geometrii dla {d_id}: {e}")
         return extent
 
-
+# ==============================================================================
+# NARZĘDZIE 2: ORTOFOTOMAPA
+# ==============================================================================
 class PobierzOrtofotomape(object):
-    """
-    Pobiera pliki rastrowe ortofotomapy z usług GUGiK na podstawie wskazanej geometrii.
-    Wyszukiwanie jest optymalizowane poprzez filtrowanie warstw WFS po wybranych latach.
-    Dodaje przedrostek typu sceny (np. RGB_) do pobieranych plików.
-    """
-
     WFS_ENDPOINTS = {
         "Standardowa": "https://mapy.geoportal.gov.pl/wss/service/PZGIK/ORTO/WFS/Skorowidze",
         "Prawdziwa (true-ortho)": "https://mapy.geoportal.gov.pl/wss/service/PZGIK/ORTO/WFS/SkorowidzPrawdziwejOrtofotomapy",
@@ -445,6 +584,7 @@ class PobierzOrtofotomape(object):
         self.label = "Pobierz ortofotomapę"
         self.description = "Narysuj obszar lub wybierz warstwę, aby pobrać rastry z WFS dla wskazanych lat."
         self.canRunInBackground = False
+        self.wfs_client = WFSClient()
 
     def getParameterInfo(self):
         param_geom = arcpy.Parameter(
@@ -495,7 +635,6 @@ class PobierzOrtofotomape(object):
         param_scena.filter.list = ["Dowolna"] + list(self.SCENE_VALUE_KEYWORDS.keys())
         param_scena.value = "RGB"
 
-        # NOWY PARAMETR: Wielkość piksela
         param_piksel = arcpy.Parameter(
             displayName="Wielkość piksela (m) [opcjonalnie]",
             name="wielkosc_piksela",
@@ -504,7 +643,7 @@ class PobierzOrtofotomape(object):
             direction="Input"
         )
         param_piksel.filter.type = "Range"
-        param_piksel.filter.list = [0.01, 10.0]  # Zakres min/max
+        param_piksel.filter.list = [0.01, 10.0]
 
         param_out_folder = arcpy.Parameter(
             displayName="Folder docelowy na pobrane pliki",
@@ -592,7 +731,7 @@ class PobierzOrtofotomape(object):
             parameterType="Optional",
             direction="Input"
         )
-        param_author.value = "Autor: Mateusz Lubański m.lubanski94@gmail.com"
+        param_author.value = "Autor: Mateusz Lubański"
 
         param_derived = arcpy.Parameter(
             displayName="Wynikowe rastry/mozaika (Ukryta)",
@@ -614,74 +753,12 @@ class PobierzOrtofotomape(object):
         p[3].enabled = not tylko_aktualna
 
         tworz_mozaike = p[8].value
-        p[9].enabled = tworz_mozaike   # param_mosaic_name
-        p[10].enabled = tworz_mozaike  # param_out_gdb
-        p[11].enabled = tworz_mozaike  # param_stats
+        p[9].enabled = tworz_mozaike
+        p[10].enabled = tworz_mozaike
+        p[11].enabled = tworz_mozaike
 
         if len(p) > 14:
-            p[14].enabled = False # param_author
-
-    def _fetch_with_retry(self, req_url, max_retries=3, delay=2.0):
-        req = urllib.request.Request(req_url, headers={"User-Agent": "Mozilla/5.0"})
-        for attempt in range(max_retries):
-            try:
-                with urllib.request.urlopen(req, timeout=60) as resp:
-                    return resp.read()
-            except Exception as e:
-                if attempt == max_retries - 1:
-                    raise e
-                time.sleep(delay)
-
-    def _get_all_typenames(self, base_url):
-        url = f"{base_url}?SERVICE=WFS&REQUEST=GetCapabilities&VERSION=2.0.0"
-        data = self._fetch_with_retry(url)
-        xml_text = data.decode("utf-8", errors="ignore")
-
-        names = sorted(set(re.findall(
-            r"<(?:\w+:)?Name>([^<]*Skorowidz[^<]*)</(?:\w+:)?Name>",
-            xml_text, re.IGNORECASE
-        )))
-        if not names:
-            raise RuntimeError("Nie znaleziono żadnej warstwy skorowidza w GetCapabilities.")
-
-        def year_of(name):
-            years = re.findall(r"(?:19|20)\d{2}", name)
-            return int(years[-1]) if years else None
-
-        dated = [(year_of(n), n) for n in names]
-        dated.sort(key=lambda t: (t[0] is None, -(t[0] or 0)))
-        return dated
-
-    def _get_feature_raw(self, base_url, typename, bbox_param):
-        url = (
-            f"{base_url}?SERVICE=WFS&REQUEST=GetFeature&VERSION=2.0.0"
-            f"&TYPENAMES={urllib.parse.quote(typename)}"
-            f"&SRSNAME=urn:ogc:def:crs:EPSG::2180&BBOX={bbox_param}"
-        )
-        data = self._fetch_with_retry(url)
-        root = ET.fromstring(data)
-
-        feature_elems = []
-        for el in root.iter():
-            local = el.tag.split("}")[-1]
-            if local in ("member", "featureMember"):
-                feature_elems.extend(list(el))
-
-        results = []
-        for feat in feature_elems:
-            attrs = {}
-            for child in feat:
-                local = child.tag.split("}")[-1].lower()
-                if child.text and child.text.strip():
-                    attrs[local] = child.text.strip()
-            if attrs:
-                results.append(attrs)
-        return results
-
-    def _get_feature(self, base_url, typename, bbox_2180):
-        xmin, ymin, xmax, ymax = bbox_2180
-        bbox_param = f"{ymin},{xmin},{ymax},{xmax},urn:ogc:def:crs:EPSG::2180"
-        return self._get_feature_raw(base_url, typename, bbox_param)
+            p[14].enabled = False
 
     def _parse_feature_scene(self, attrs):
         for key in self.SCENE_CANDIDATE_KEYS:
@@ -692,6 +769,13 @@ class PobierzOrtofotomape(object):
                 if any(kw in val_lower for kw in ["cir", "ir", "podczerwie"]): return "CIR"
                 if any(kw in val_lower for kw in ["czarno", "panchromat", "szaro", "bw"]): return "BM"
         return "UNKNOWN"
+
+    def _extract_year(self, attrs):
+        for k, v in attrs.items():
+            if k in ("rok", "rok_nalotu", "rok_zdjecia", "data_zdjecia", "rok_wydania") or "rok" in k:
+                match = re.search(r"(19|20)\d{2}", str(v))
+                if match: return match.group(0)
+        return attrs.get("rok_skorowidza", "")
 
     def _filter_by_scene(self, features, scena):
         if not scena or scena == "Dowolna":
@@ -710,31 +794,29 @@ class PobierzOrtofotomape(object):
         return matched
 
     def _find_tiles(self, base_url, bbox_2180, tylko_aktualna, wybrane_lata, scena, piksel, pelny_arkusz, messages):
-        editions = self._get_all_typenames(base_url)
+        editions = self.wfs_client.get_all_typenames(base_url)
 
         if not tylko_aktualna and wybrane_lata:
-            filtered_editions = []
-            for y, tn in editions:
-                if str(y) in wybrane_lata:
-                    filtered_editions.append((y, tn))
-            editions = filtered_editions
+            editions = [(y, tn) for y, tn in editions if str(y) in wybrane_lata]
 
         all_found_features = []
 
         for yr, typename in editions:
             try:
-                features = self._get_feature(base_url, typename, bbox_2180)
+                features = self.wfs_client.get_features(base_url, typename, bbox_2180)
             except Exception as e:
                 messages.addWarningMessage(f"Ostrzeżenie: Błąd pobierania danych dla warstwy {typename}: {e}")
                 continue
 
             if features:
+                for f in features:
+                    if yr: f['rok_skorowidza'] = str(yr)
+
                 if pelny_arkusz:
                     features = [f for f in features if str(f.get('czy_ark_wypelniony', '')).strip().lower() in ['1', 'true', 'tak', 't']]
 
                 features = self._filter_by_scene(features, scena)
 
-                # Filtrowanie po wielkości piksela z kolumny piksel
                 if piksel is not None:
                     filtered_by_pix = []
                     for f in features:
@@ -766,25 +848,22 @@ class PobierzOrtofotomape(object):
         if not parsed_name:
             parsed_name = "ortofotomapa_pobrana"
 
-        fname = f"{prefix}_{parsed_name}"
+        fname = f"{prefix}_{parsed_name}" if prefix else parsed_name
         out_path = os.path.join(out_folder, fname)
 
         if os.path.exists(out_path) and not overwrite:
             messages.addMessage(f"Plik już istnieje, pomijam pobieranie: {fname}")
             return out_path
 
-        data = self._fetch_with_retry(url)
-
-        if os.path.exists(out_path) and not overwrite:
-            return out_path
-
-        with open(out_path, "wb") as f:
-            f.write(data)
-        messages.addMessage(f"Pobrano: {fname}")
+        messages.addMessage(f"Rozpoczynanie pobierania: {fname}...")
+        HttpClient.download_stream(url, out_path, messages=messages)
+        messages.addMessage(f"Pobrano pomyślnie: {fname}")
         return out_path
 
     def _extract_rasters(self, path, out_folder, prefix):
         raster_ext = (".tif", ".tiff", ".jp2", ".ecw")
+        out_folder_abs = os.path.abspath(out_folder)
+
         if path.lower().endswith(".zip") and zipfile.is_zipfile(path):
             extracted = []
             with zipfile.ZipFile(path) as z:
@@ -792,8 +871,12 @@ class PobierzOrtofotomape(object):
                 members_to_extract = raster_members or z.namelist()
                 for name in members_to_extract:
                     base_inside = os.path.basename(name)
-                    out_name_prefixed = f"{prefix}_{base_inside}"
-                    out_full_path = os.path.join(out_folder, out_name_prefixed)
+                    out_name_prefixed = f"{prefix}_{base_inside}" if prefix else base_inside
+                    out_full_path = os.path.abspath(os.path.join(out_folder, out_name_prefixed))
+
+                    if not os.path.commonpath([out_folder_abs, out_full_path]).startswith(out_folder_abs):
+                        continue
+
                     with open(out_full_path, "wb") as f_out:
                         f_out.write(z.read(name))
                     extracted.append(out_full_path)
@@ -808,14 +891,8 @@ class PobierzOrtofotomape(object):
         rodzaj = p[1].valueAsText
         tylko_aktualna = p[2].value
 
-        wybrane_lata = []
-        lata_str = p[3].valueAsText
-        if lata_str:
-            wybrane_lata = [rok.strip("'\"") for rok in lata_str.split(';')]
-
+        wybrane_lata = [rok.strip("'\"") for rok in (p[3].valueAsText or "").split(';')] if p[3].valueAsText else []
         scena = p[4].valueAsText
-
-        # Pobranie opcjonalnego parametru piksela
         piksel = float(p[5].value) if p[5].value is not None else None
 
         out_folder = p[6].valueAsText
@@ -838,7 +915,6 @@ class PobierzOrtofotomape(object):
         src_sr = arcpy.Describe(in_features).spatialReference
 
         tiles_to_download = {}
-
         arcpy.AddMessage("Faza 1/2: Przeszukiwanie wybranych skorowidzów WFS GUGiK...")
 
         with arcpy.da.SearchCursor(in_features, ["SHAPE@"]) as cur:
@@ -849,11 +925,7 @@ class PobierzOrtofotomape(object):
                     geom = geom.projectAs(sr_2180)
 
                 ext = geom.extent
-                if geom.type.lower() == "point":
-                    eps = 5.0
-                    bbox = (ext.XMin - eps, ext.YMin - eps, ext.XMax + eps, ext.YMax + eps)
-                else:
-                    bbox = (ext.XMin, ext.YMin, ext.XMax, ext.YMax)
+                bbox = (ext.XMin - 5.0, ext.YMin - 5.0, ext.XMax + 5.0, ext.YMax + 5.0) if geom.type.lower() == "point" else (ext.XMin, ext.YMin, ext.XMax, ext.YMax)
 
                 try:
                     features = self._find_tiles(base_url, bbox, tylko_aktualna, wybrane_lata, scena, piksel, pelny_arkusz, messages)
@@ -871,7 +943,7 @@ class PobierzOrtofotomape(object):
         if not tiles_to_download:
             return arcpy.AddWarning("Nie znaleziono żadnych rastrów spełniających kryteria we wskazanej lokalizacji.")
 
-        arcpy.AddMessage(f"Zakończono wyszukiwanie. Znaleziono unikalnych plików do pobrania: {len(tiles_to_download)}")
+        arcpy.AddMessage(f"Zakończono wyszukiwanie. Pliki spełniające warunki pobierania: {len(tiles_to_download)}")
         arcpy.AddMessage("Faza 2/2: Pobieranie i rozpakowywanie plików...")
 
         all_downloaded_rasters = set()
@@ -879,12 +951,16 @@ class PobierzOrtofotomape(object):
 
         for url, attrs in tiles_to_download.items():
             try:
-                scene_prefix = self._parse_feature_scene(attrs)
-                local_path = self._download(url, out_folder, scene_prefix, messages, overwrite)
+                scene_type = self._parse_feature_scene(attrs)
+                year_str = self._extract_year(attrs)
+                prefix_parts = [p for p in [year_str, scene_type] if p]
+                full_prefix = "_".join(prefix_parts)
+
+                local_path = self._download(url, out_folder, full_prefix, messages, overwrite)
                 attrs['lokalna_sciezka'] = local_path
                 all_metadata.append(attrs)
 
-                rasters = self._extract_rasters(local_path, out_folder, scene_prefix)
+                rasters = self._extract_rasters(local_path, out_folder, full_prefix)
                 all_downloaded_rasters.update(rasters)
             except Exception as e:
                 arcpy.AddWarning(f"Błąd pobierania z adresu {url}: {e}")
@@ -939,13 +1015,10 @@ class PobierzOrtofotomape(object):
             except Exception as e:
                 arcpy.AddWarning(f"Nie udało się dodać warstw do mapy: {e}")
 
+# ==============================================================================
+# NARZĘDZIE 3: CHMURY PUNKTÓW
+# ==============================================================================
 class PobierzChmuryPunktow(object):
-    """
-    Pobiera pliki chmur punktów (LIDAR) z usług GUGiK na podstawie wskazanej geometrii.
-    Wyszukiwanie jest optymalizowane poprzez filtrowanie warstw WFS po wybranych latach.
-    Obsługuje układy wysokościowe KRON86 oraz EVRF2007.
-    """
-
     WFS_ENDPOINTS = {
         "PL-KRON86-NH": "https://mapy.geoportal.gov.pl/wss/service/PZGIK/DanePomiaroweLidarKRON86/WFS/Skorowidze",
         "PL-EVRF2007-NH": "https://mapy.geoportal.gov.pl/wss/service/PZGIK/DanePomiaroweLidarEVRF2007/WFS/Skorowidze",
@@ -955,6 +1028,7 @@ class PobierzChmuryPunktow(object):
         self.label = "Pobierz chmury punktów LIDAR"
         self.description = "Narysuj obszar lub wybierz warstwę, aby pobrać chmury punktów z WFS dla wybranych układów wysokościowych."
         self.canRunInBackground = False
+        self.wfs_client = WFSClient()
 
     def getParameterInfo(self):
         param_geom = arcpy.Parameter(
@@ -1061,61 +1135,15 @@ class PobierzChmuryPunktow(object):
         tworz_mozaike = p[5].value
         p[6].enabled = tworz_mozaike
 
-    def _fetch_with_retry(self, req_url, max_retries=3, delay=2.0):
-        req = urllib.request.Request(req_url, headers={"User-Agent": "Mozilla/5.0"})
-        for attempt in range(max_retries):
-            try:
-                with urllib.request.urlopen(req, timeout=60) as resp:
-                    return resp.read()
-            except Exception as e:
-                if attempt == max_retries - 1: raise e
-                time.sleep(delay)
-
-    def _get_all_typenames(self, base_url):
-        url = f"{base_url}?SERVICE=WFS&REQUEST=GetCapabilities&VERSION=2.0.0"
-        data = self._fetch_with_retry(url)
-        xml_text = data.decode("utf-8", errors="ignore")
-
-        names = sorted(set(re.findall(
-            r"<(?:\w+:)?Name>([^<]*Skorowidz[^<]*)</(?:\w+:)?Name>",
-            xml_text, re.IGNORECASE
-        )))
-        if not names:
-            raise RuntimeError("Nie znaleziono żadnej warstwy skorowidza.")
-
-        def year_of(name):
-            years = re.findall(r"(?:19|20)\d{2}", name)
-            return int(years[-1]) if years else None
-
-        dated = [(year_of(n), n) for n in names]
-        dated.sort(key=lambda t: (t[0] is None, -(t[0] or 0)))
-        return dated
-
-    def _get_feature(self, base_url, typename, bbox_2180):
-        xmin, ymin, xmax, ymax = bbox_2180
-        bbox_param = f"{ymin},{xmin},{ymax},{xmax},urn:ogc:def:crs:EPSG::2180"
-        url = (
-            f"{base_url}?SERVICE=WFS&REQUEST=GetFeature&VERSION=2.0.0"
-            f"&TYPENAMES={urllib.parse.quote(typename)}"
-            f"&SRSNAME=urn:ogc:def:crs:EPSG::2180&BBOX={bbox_param}"
-        )
-        data = self._fetch_with_retry(url)
-        root = ET.fromstring(data)
-
-        results = []
-        for feat in root.iter():
-            local = feat.tag.split("}")[-1]
-            if local in ("member", "featureMember"):
-                attrs = {}
-                for child in list(feat)[0]:
-                    tag = child.tag.split("}")[-1].lower()
-                    if child.text and child.text.strip():
-                        attrs[tag] = child.text.strip()
-                if attrs: results.append(attrs)
-        return results
+    def _extract_year(self, attrs):
+        for k, v in attrs.items():
+            if k in ("rok", "rok_nalotu", "rok_zdjecia", "data_zdjecia", "rok_wydania") or "rok" in k:
+                match = re.search(r"(19|20)\d{2}", str(v))
+                if match: return match.group(0)
+        return attrs.get("rok_skorowidza", "")
 
     def _find_tiles(self, base_url, bbox_2180, tylko_aktualna, wybrane_lata, pelny_arkusz, messages):
-        editions = self._get_all_typenames(base_url)
+        editions = self.wfs_client.get_all_typenames(base_url)
 
         if not tylko_aktualna and wybrane_lata:
             editions = [(y, tn) for y, tn in editions if str(y) in wybrane_lata]
@@ -1123,9 +1151,12 @@ class PobierzChmuryPunktow(object):
         all_found = []
         for yr, typename in editions:
             try:
-                features = self._get_feature(base_url, typename, bbox_2180)
+                features = self.wfs_client.get_features(base_url, typename, bbox_2180)
 
                 if features:
+                    for f in features:
+                        if yr: f['rok_skorowidza'] = str(yr)
+
                     if pelny_arkusz:
                         features = [f for f in features if str(f.get('czy_ark_wypelniony', '')).strip().lower() in ['1', 'true', 'tak', 't']]
 
@@ -1139,24 +1170,31 @@ class PobierzChmuryPunktow(object):
             raise RuntimeError("Nie znaleziono kafli spełniających kryteria we wszystkich przeszukiwanych edycjach skorowidza.")
         return all_found
 
-    def _download_and_extract(self, url, out_folder, overwrite, messages):
+    def _download_and_extract(self, url, out_folder, prefix, overwrite, messages):
         os.makedirs(out_folder, exist_ok=True)
         parsed_name = os.path.basename(urllib.parse.urlparse(url).path)
-        out_path = os.path.join(out_folder, parsed_name)
+        fname = f"{prefix}_{parsed_name}" if prefix else parsed_name
+        out_path = os.path.join(out_folder, fname)
 
         if not (os.path.exists(out_path) and not overwrite):
-            data = self._fetch_with_retry(url)
-            with open(out_path, "wb") as f:
-                f.write(data)
-            messages.addMessage(f"Pobrano: {parsed_name}")
+            messages.addMessage(f"Rozpoczynanie pobierania pliku LIDAR: {fname}...")
+            HttpClient.download_stream(url, out_path, messages=messages)
+            messages.addMessage(f"Pobrano: {fname}")
 
         extracted_files = []
         point_ext = (".las", ".laz")
+        out_folder_abs = os.path.abspath(out_folder)
+
         if out_path.lower().endswith(".zip") and zipfile.is_zipfile(out_path):
             with zipfile.ZipFile(out_path) as z:
                 members = [n for n in z.namelist() if n.lower().endswith(point_ext)]
                 for name in members:
-                    ext_path = os.path.join(out_folder, os.path.basename(name))
+                    ext_name = f"{prefix}_{os.path.basename(name)}" if prefix else os.path.basename(name)
+                    ext_path = os.path.abspath(os.path.join(out_folder, ext_name))
+
+                    if not os.path.commonpath([out_folder_abs, ext_path]).startswith(out_folder_abs):
+                        continue
+
                     if not os.path.exists(ext_path) or overwrite:
                         with open(ext_path, "wb") as f_out:
                             f_out.write(z.read(name))
@@ -1212,13 +1250,14 @@ class PobierzChmuryPunktow(object):
         if not tiles_to_download:
             return arcpy.AddWarning("Nie znaleziono chmur punktów we wskazanej lokalizacji.")
 
-        arcpy.AddMessage(f"Znaleziono {len(tiles_to_download)} plików. Pobieranie...")
+        arcpy.AddMessage(f"Zakończono wyszukiwanie. Pliki spełniające warunki pobierania: {len(tiles_to_download)}. Rozpoczynam pobieranie...")
         all_point_clouds = set()
         all_metadata = []
 
         for url, attrs in tiles_to_download.items():
             try:
-                files = self._download_and_extract(url, out_folder, overwrite, messages)
+                year_str = self._extract_year(attrs)
+                files = self._download_and_extract(url, out_folder, year_str, overwrite, messages)
                 all_point_clouds.update(files)
 
                 attrs['lokalna_sciezka'] = ", ".join(files)
@@ -1268,13 +1307,10 @@ class PobierzChmuryPunktow(object):
             except Exception as e:
                 arcpy.AddWarning(f"Błąd dodawania wyników do mapy: {e}")
 
-
+# ==============================================================================
+# NARZĘDZIE 4: NMT / NMPT
+# ==============================================================================
 class PobierzNMTNMPT(object):
-    """
-    Pobiera pliki NMT (Numeryczny Model Terenu) lub NMPT (Numeryczny Model Pokrycia Terenu)
-    z usług WFS GUGiK na podstawie wskazanej geometrii wektorowej.
-    """
-
     WFS_ENDPOINTS = {
         "NMT": {
             "PL-EVRF2007-NH": "https://mapy.geoportal.gov.pl/wss/service/PZGIK/NumerycznyModelTerenuEVRF2007/WFS/Skorowidze",
@@ -1290,6 +1326,7 @@ class PobierzNMTNMPT(object):
         self.label = "Pobierz NMT / NMPT"
         self.description = "Pobiera pliki NMT/NMPT z WFS GUGiK dla wybranego obszaru, nadaje układ 2180 i opcjonalnie tworzy mozaikę."
         self.canRunInBackground = False
+        self.wfs_client = WFSClient()
 
     def getParameterInfo(self):
         param_geom = arcpy.Parameter(
@@ -1350,7 +1387,6 @@ class PobierzNMTNMPT(object):
         param_format.filter.list = ["Wszystkie", "Arc/Info ASCII Grid (.asc)", "TIFF (.tif / .tiff)"]
         param_format.value = "Wszystkie"
 
-        # NOWY PARAMETR: Rozdzielczość przestrzenna
         param_rozdzielczosc = arcpy.Parameter(
             displayName="Rozdzielczość przestrzenna (m) [opcjonalnie]",
             name="rozdzielczosc",
@@ -1359,7 +1395,7 @@ class PobierzNMTNMPT(object):
             direction="Input"
         )
         param_rozdzielczosc.filter.type = "Range"
-        param_rozdzielczosc.filter.list = [0.1, 100.0]  # Zakres min/max
+        param_rozdzielczosc.filter.list = [0.1, 100.0]
 
         param_out_folder = arcpy.Parameter(
             displayName="Folder docelowy na pobrane pliki",
@@ -1427,67 +1463,15 @@ class PobierzNMTNMPT(object):
         tworz_mozaike = p[8].value
         p[9].enabled = tworz_mozaike
 
-    def _fetch_with_retry(self, req_url, max_retries=3, delay=2.0):
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/119.0",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-        }
-        req = urllib.request.Request(req_url, headers=headers)
-        for attempt in range(max_retries):
-            try:
-                with urllib.request.urlopen(req, timeout=60) as resp:
-                    return resp.read()
-            except Exception as e:
-                if attempt == max_retries - 1:
-                    raise e
-                time.sleep(delay)
-
-    def _get_all_typenames(self, base_url):
-        url = f"{base_url}?SERVICE=WFS&REQUEST=GetCapabilities&VERSION=2.0.0"
-        data = self._fetch_with_retry(url)
-        xml_text = data.decode("utf-8", errors="ignore")
-
-        names = sorted(set(re.findall(
-            r"<(?:\w+:)?Name>([^<]*Skorowidz[^<]*)</(?:\w+:)?Name>",
-            xml_text, re.IGNORECASE
-        )))
-        if not names:
-            raise RuntimeError("Nie znaleziono żadnej warstwy skorowidza.")
-
-        def year_of(name):
-            years = re.findall(r"(?:19|20)\d{2}", name)
-            return int(years[-1]) if years else None
-
-        dated = [(year_of(n), n) for n in names]
-        dated.sort(key=lambda t: (t[0] is None, -(t[0] or 0)))
-        return dated
-
-    def _get_feature(self, base_url, typename, bbox_2180):
-        xmin, ymin, xmax, ymax = bbox_2180
-        bbox_param = f"{ymin},{xmin},{ymax},{xmax},urn:ogc:def:crs:EPSG::2180"
-        url = (
-            f"{base_url}?SERVICE=WFS&REQUEST=GetFeature&VERSION=2.0.0"
-            f"&TYPENAMES={urllib.parse.quote(typename)}"
-            f"&SRSNAME=urn:ogc:def:crs:EPSG::2180&BBOX={bbox_param}"
-        )
-        data = self._fetch_with_retry(url)
-        root = ET.fromstring(data)
-
-        results = []
-        for feat in root.iter():
-            local = feat.tag.split("}")[-1]
-            if local in ("member", "featureMember"):
-                attrs = {}
-                for child in list(feat)[0]:
-                    tag = child.tag.split("}")[-1].lower()
-                    if child.text and child.text.strip():
-                        attrs[tag] = child.text.strip()
-                if attrs:
-                    results.append(attrs)
-        return results
+    def _extract_year(self, attrs):
+        for k, v in attrs.items():
+            if k in ("rok", "rok_nalotu", "rok_zdjecia", "data_zdjecia", "rok_wydania") or "rok" in k:
+                match = re.search(r"(19|20)\d{2}", str(v))
+                if match: return match.group(0)
+        return attrs.get("rok_skorowidza", "")
 
     def _find_tiles(self, base_url, bbox_2180, tylko_aktualna, wybrane_lata, format_danych, rozdzielczosc, pelny_arkusz, messages):
-        editions = self._get_all_typenames(base_url)
+        editions = self.wfs_client.get_all_typenames(base_url)
 
         if not tylko_aktualna and wybrane_lata:
             editions = [(y, tn) for y, tn in editions if str(y) in wybrane_lata]
@@ -1495,9 +1479,12 @@ class PobierzNMTNMPT(object):
         all_found = []
         for yr, typename in editions:
             try:
-                features = self._get_feature(base_url, typename, bbox_2180)
+                features = self.wfs_client.get_features(base_url, typename, bbox_2180)
 
                 if features:
+                    for f in features:
+                        if yr: f['rok_skorowidza'] = str(yr)
+
                     if pelny_arkusz:
                         features = [f for f in features if str(f.get('czy_ark_wypelniony', '')).strip().lower() in ['1', 'true', 'tak', 't']]
 
@@ -1505,14 +1492,12 @@ class PobierzNMTNMPT(object):
                         fmt_key = "asc" if "ASCII" in format_danych else "tif"
                         features = [f for f in features if fmt_key in str(f.get('format', '')).lower() or fmt_key in str(f.get('url_do_pobrania', '')).lower()]
 
-                    # Filtrowanie po rozdzielczości z pola char_przestrz
                     if rozdzielczosc is not None:
                         filtered_by_res = []
                         for f in features:
                             res_val = f.get('char_przestrz', '')
                             if res_val:
                                 try:
-                                    # Wyciągnięcie wartości liczbowej z ciągu znaków (np. "1.0 m" lub "1,0")
                                     match = re.search(r"(\d+(?:[\.,]\d+)?)", str(res_val))
                                     if match:
                                         parsed_res = float(match.group(1).replace(',', '.'))
@@ -1533,25 +1518,31 @@ class PobierzNMTNMPT(object):
             raise RuntimeError("Nie znaleziono kafli spełniających kryteria.")
         return all_found
 
-    def _download_and_extract(self, url, out_folder, overwrite, sr_2180, messages):
+    def _download_and_extract(self, url, out_folder, prefix, overwrite, sr_2180, messages):
         os.makedirs(out_folder, exist_ok=True)
         parsed_name = os.path.basename(urllib.parse.urlparse(url).path)
-        out_path = os.path.join(out_folder, parsed_name)
+        fname = f"{prefix}_{parsed_name}" if prefix else parsed_name
+        out_path = os.path.join(out_folder, fname)
 
         if not (os.path.exists(out_path) and not overwrite):
-            data = self._fetch_with_retry(url)
-            with open(out_path, "wb") as f:
-                f.write(data)
-            messages.addMessage(f"Pobrano: {parsed_name}")
+            messages.addMessage(f"Pobieranie: {fname}...")
+            HttpClient.download_stream(url, out_path, messages=messages)
+            messages.addMessage(f"Pobrano: {fname}")
 
         extracted_files = []
         raster_ext = (".asc", ".tif", ".tiff", ".img", ".xyz")
+        out_folder_abs = os.path.abspath(out_folder)
 
         if out_path.lower().endswith(".zip") and zipfile.is_zipfile(out_path):
             with zipfile.ZipFile(out_path) as z:
                 members = [n for n in z.namelist() if n.lower().endswith(raster_ext)]
                 for name in members:
-                    ext_path = os.path.join(out_folder, os.path.basename(name))
+                    ext_name = f"{prefix}_{os.path.basename(name)}" if prefix else os.path.basename(name)
+                    ext_path = os.path.abspath(os.path.join(out_folder, ext_name))
+
+                    if not os.path.commonpath([out_folder_abs, ext_path]).startswith(out_folder_abs):
+                        continue
+
                     if not os.path.exists(ext_path) or overwrite:
                         with open(ext_path, "wb") as f_out:
                             f_out.write(z.read(name))
@@ -1581,7 +1572,6 @@ class PobierzNMTNMPT(object):
         wybrane_lata = [rok.strip("'\"") for rok in (p[4].valueAsText or "").split(';')] if p[4].valueAsText else []
         format_danych = p[5].valueAsText
 
-        # Pobranie opcjonalnego parametru rozdzielczości
         rozdzielczosc = float(p[6].value) if p[6].value is not None else None
 
         out_folder = p[7].valueAsText
@@ -1628,13 +1618,14 @@ class PobierzNMTNMPT(object):
         if not tiles_to_download:
             return arcpy.AddWarning(f"Nie znaleziono plików {key_typ} we wskazanej lokalizacji z podanymi kryteriami.")
 
-        arcpy.AddMessage(f"Znaleziono {len(tiles_to_download)} plików {key_typ}. Pobieranie...")
+        arcpy.AddMessage(f"Znaleziono {len(tiles_to_download)} unikalnych plików {key_typ}. Rozpoczynanie pobierania...")
         all_rasters = set()
         all_metadata = []
 
         for url, attrs in tiles_to_download.items():
             try:
-                files = self._download_and_extract(url, out_folder, overwrite, sr_2180, messages)
+                year_str = self._extract_year(attrs)
+                files = self._download_and_extract(url, out_folder, year_str, overwrite, sr_2180, messages)
                 all_rasters.update(files)
 
                 attrs['lokalna_sciezka'] = ", ".join(files)
@@ -1691,18 +1682,21 @@ class PobierzNMTNMPT(object):
             except Exception as e:
                 arcpy.AddWarning(f"Błąd dodawania wyników do mapy: {e}")
 
-
+# ==============================================================================
+# NARZĘDZIE 5: SKOROWIDZ EGIB (WFS - Z AUTOMATYCZNYM KAFELKOWANIEM BBOX)
+# ==============================================================================
 class PobierzSkorowidzEGIB(object):
     """
     Pobiera geometrie działek i/lub budynków z Usługi Zbiorczej WFS EGiB GUGiK
-    dla wskazanego obszaru za pomocą zapytań POST WFS 2.0.0.
+    dla wskazanego obszaru za pomocą zapytań WFS 2.0.0 z automatycznym kafelkowaniem obszaru.
+    Raportuje postęp pobierania w paczkach po 100 obiektów.
     """
 
     WFS_URL = "https://mapy.geoportal.gov.pl/wss/service/PZGIK/EGIB/WFS/UslugaZbiorcza"
 
     def __init__(self):
         self.label = "Pobierz obrys działek/budynków (WFS)"
-        self.description = "Pobiera geometrie działek lub budynków ze zbiorczej usługi WFS EGiB dla podanego obszaru."
+        self.description = "Pobiera geometrie działek lub budynków ze zbiorczej usługi WFS EGiB dla podanego obszaru z podziałem na mniejsze kafelki."
         self.canRunInBackground = False
 
     def getParameterInfo(self):
@@ -1753,7 +1747,7 @@ class PobierzSkorowidzEGIB(object):
             parameterType="Optional",
             direction="Input"
         )
-        param_author.value = "Autor: Mateusz Lubański m.lubanski94@gmail.com"
+        param_author.value = "Autor: Mateusz Lubański"
 
         param_derived = arcpy.Parameter(
             displayName="Wynikowa warstwa (Ukryta)",
@@ -1772,26 +1766,22 @@ class PobierzSkorowidzEGIB(object):
         if len(p) > 4:
             p[4].enabled = False
 
-    def _post_wfs(self, xml_payload, max_retries=3, delay=2.0):
-        """Wysyła zapytanie WFS XML metodą POST"""
-        headers = {
-            "Content-Type": "application/xml",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-        }
-        req = urllib.request.Request(self.WFS_URL, data=xml_payload.encode('utf-8'), headers=headers)
-        for attempt in range(max_retries):
-            try:
-                with urllib.request.urlopen(req, timeout=60) as resp:
-                    return resp.read()
-            except Exception as e:
-                if attempt == max_retries - 1:
-                    raise e
-                time.sleep(delay)
+    def _split_bbox(self, ext, tile_size=500.0):
+        """Dzieli zasięg (extent) na siatkę mniejszych BBOX-ów w metrach[cite: 4]."""
+        bboxes = []
+        x = ext.XMin
+        while x < ext.XMax:
+            next_x = min(x + tile_size, ext.XMax)
+            y = ext.YMin
+            while y < ext.YMax:
+                next_y = min(y + tile_size, ext.YMax)
+                bboxes.append((x, y, next_x, next_y))
+                y = next_y
+            x = next_x
+        return bboxes
 
     def _get_wfs_features(self, bbox_2180, type_name):
         xmin, ymin, xmax, ymax = bbox_2180
-
-        # Northing,Easting order for urn:ogc:def:crs:EPSG::2180
         bbox_param = f"{ymin},{xmin},{ymax},{xmax},urn:ogc:def:crs:EPSG::2180"
 
         params = {
@@ -1802,28 +1792,21 @@ class PobierzSkorowidzEGIB(object):
             "bbox": bbox_param,
         }
         url = f"{self.WFS_URL}?{urllib.parse.urlencode(params)}"
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-        req = urllib.request.Request(url, headers=headers)
 
-        data = None
-        for attempt in range(3):
-            try:
-                with urllib.request.urlopen(req, timeout=60) as resp:
-                    data = resp.read()
-                    break
-            except Exception as e:
-                if attempt == 2:
-                    arcpy.AddWarning(f"Błąd zapytania WFS (GET): {e}")
-                    return []
-                time.sleep(2.0)
-
-        if not data:
-            return []
-        if b"ExceptionReport" in data:
-            arcpy.AddWarning(f"WFS zwrócił ExceptionReport: {data[:1000]}")
+        try:
+            data = HttpClient.fetch_bytes(url, timeout=45)
+        except Exception as e:
+            arcpy.AddWarning(f"Błąd zapytania WFS (GET): {e}")
             return []
 
-        root = ET.fromstring(data)
+        if not data or b"ExceptionReport" in data:
+            return []
+
+        try:
+            root = ET.fromstring(data)
+        except Exception:
+            return []
+
         features_data = []
 
         for feat in root.iter():
@@ -1897,8 +1880,9 @@ class PobierzSkorowidzEGIB(object):
 
         src_sr = arcpy.Describe(in_features).spatialReference
         initial_count = len(processed_ids)
+        current_added = 0
 
-        arcpy.AddMessage(f"Pobieranie obiektów z WFS EGiB ({type_name})...")
+        arcpy.AddMessage(f"Pobieranie obiektów z WFS EGiB ({type_name}). Rozpoczynam przetwarzanie...")
 
         insert_fields = ["SHAPE@", "ID_OBIEKTU", "INFO"]
         with arcpy.da.InsertCursor(out_fc, insert_fields) as cursor:
@@ -1911,35 +1895,52 @@ class PobierzSkorowidzEGIB(object):
                         input_geom = input_geom.projectAs(sr_2180)
 
                     ext = input_geom.extent
-                    bbox = (ext.XMin, ext.YMin, ext.XMax, ext.YMax)
+                    # Dzielimy obszar na kafelki 500x500 metrow[cite: 4]
+                    sub_bboxes = self._split_bbox(ext, tile_size=500.0)
 
-                    try:
-                        features = self._get_wfs_features(bbox, type_name)
-                        for wkt, attrs in features:
-                            try:
-                                poly_geom = arcpy.FromWKT(wkt, sr_2180)
+                    for bbox in sub_bboxes:
+                        # Odrzucamy kafelki poza poligonem wejściowym[cite: 4]
+                        tile_poly = arcpy.Polygon(arcpy.Array([
+                            arcpy.Point(bbox[0], bbox[1]),
+                            arcpy.Point(bbox[0], bbox[3]),
+                            arcpy.Point(bbox[2], bbox[3]),
+                            arcpy.Point(bbox[2], bbox[1])
+                        ]), sr_2180)
 
-                                # Filtr przestrzenny
-                                if poly_geom and not poly_geom.disjoint(input_geom):
-                                    obj_id = attrs.get("ID_DZIALKI", attrs.get("ID_BUDYNKU", attrs.get("gml_id", "Nieznany")))
+                        if input_geom.disjoint(tile_poly):
+                            continue
 
-                                    if obj_id in processed_ids and obj_id != "Nieznany":
-                                        continue
+                        try:
+                            features = self._get_wfs_features(bbox, type_name)
+                            for wkt, attrs in features:
+                                try:
+                                    poly_geom = arcpy.FromWKT(wkt, sr_2180)
 
-                                    info = str(attrs)[:250]
-                                    cursor.insertRow((poly_geom, obj_id, info))
-                                    processed_ids.add(obj_id)
-                            except Exception as ge:
-                                arcpy.AddWarning(f"Błąd geometrii obiektu: {ge}")
-                    except Exception as e:
-                        arcpy.AddWarning(f"Błąd zapytania WFS: {e}")
+                                    if poly_geom and not poly_geom.disjoint(input_geom):
+                                        obj_id = attrs.get("ID_DZIALKI", attrs.get("ID_BUDYNKU", attrs.get("gml_id", "Nieznany")))
+
+                                        if obj_id in processed_ids and obj_id != "Nieznany":
+                                            continue
+
+                                        info = str(attrs)[:250]
+                                        cursor.insertRow((poly_geom, obj_id, info))
+                                        processed_ids.add(obj_id)
+
+                                        # Zliczanie pobranych i zapisanych obiektów z powiadomieniem co 100
+                                        current_added += 1
+                                        if current_added % 100 == 0:
+                                            arcpy.AddMessage(f"Pobrano i zapisano {current_added} obiektów ({typ_obj.lower()})...")
+
+                                except Exception as ge:
+                                    arcpy.AddWarning(f"Błąd geometrii obiektu: {ge}")
+                        except Exception as e:
+                            arcpy.AddWarning(f"Błąd zapytania WFS: {e}")
 
         added_count = len(processed_ids) - initial_count
-        arcpy.AddMessage(f"Pobrano i dopisano obiektów: {added_count}")
+        arcpy.AddMessage(f"Zakończono! Łącznie pobrano i dopisano obiektów: {added_count}")
 
-        # Jeśli brak obiektów – wywołaj ostrzeżenie (żółty kolor okna wykonania)
         if added_count == 0:
-            arcpy.AddWarning("W przypadku braku obiektów, sprawdź stan usługi dla wybranego powiatu na stronie Ewidencji Zbiorów i Usług Danych Przestrzennych (EZiUDP)")
+            arcpy.AddWarning("W przypadku braku obiektów, sprawdź stan usługi dla wybranego powiatu na stronie EZiUDP.")
 
         if len(p) > 5:
             p[5].value = out_fc
@@ -1955,7 +1956,6 @@ class PobierzSkorowidzEGIB(object):
                     active_map.addDataFromPath(out_fc)
                     arcpy.AddMessage("Dodano warstwę do aktywnej mapy.")
 
-                # Wymuszenie odświeżenia przerysowania widoku mapy
                 if active_view:
                     active_view.refresh()
         except Exception:
