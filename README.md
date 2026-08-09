@@ -10,9 +10,18 @@ W środku znajdziesz narzędzia pozwalające na pobranie:
 
 --------------------------------------------------------
 ### <b> Instalacja </b>
-Aby dodać toolboxa do projektu należy w panelu katalog kliknąć PPM na Tolboxes i wybrać opcję Add Toolbox. Następnie PPM na samym przyborniku -> Dodaj do nowych projektów. Dzięki temu nie będzie potrzeby dodawać go za każdym razem ponownie.
+
+Pobierz kod ze strony:
+
+<img width="410" height="392" alt="image" src="https://github.com/user-attachments/assets/ef8d1bd9-f857-402a-aab9-cb4c7d1f26ba" />
+
+Wypakuj pobrane archiwum. Aby dodać toolboxa do projektu należy w panelu katalog kliknąć PPM na Tolboxes i wybrać opcję Add Toolbox. 
 
 <img width="767" height="432" alt="image" src="https://github.com/user-attachments/assets/289af5cf-0ee6-4a67-bbbe-36e65665e790" />
+
+Następnie PPM na samym przyborniku -> Dodaj do nowych projektów. Dzięki temu nie będzie potrzeby dodawać go za każdym razem ponownie.
+
+<img width="404" height="501" alt="image" src="https://github.com/user-attachments/assets/5d2a8b58-4ff6-4218-9f61-23b9c84e9639" />
 
 --------------------------------------------------------
 ## <b>ZAWARTOSĆ PRZYBORNIKA</b>
