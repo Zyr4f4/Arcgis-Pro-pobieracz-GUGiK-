@@ -13,7 +13,7 @@ W środku znajdziesz narzędzia pozwalające na pobranie:
 
 Pobierz kod ze strony:
 
-<img width="410" height="392" alt="image" src="https://github.com/user-attachments/assets/ef8d1bd9-f857-402a-aab9-cb4c7d1f26ba" />
+<img width="410" height="392" alt="image" src="https://github.com/user-attachments/assets/9be618ba-4ecc-42c9-9e98-1ee64ea6af36" />
 
 Wypakuj pobrane archiwum. Aby dodać toolboxa do projektu należy w panelu katalog kliknąć PPM na Tolboxes i wybrać opcję Add Toolbox. 
 
