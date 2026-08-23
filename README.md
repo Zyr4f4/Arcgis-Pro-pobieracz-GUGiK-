@@ -7,6 +7,7 @@ W środku znajdziesz narzędzia pozwalające na pobranie:
 - Ortofotomapy
 - NMT/NMPT
 - Chmur punktów
+- Aktualnych paczek danych BDOT10k
 
 --------------------------------------------------------
 ### <b> Instalacja </b>
@@ -74,6 +75,12 @@ Opcjonalnie możemy skonwertować dane do .tiff i dodać do okna mapy.
 Dane pobierane są po wyborze układu wysokościowego. Aby dodać dane do okna mapy konieczne będzie utworzenie LAS Datasetu (Arcgis nie obsługuje plików .laz)
 
 <img width="769" height="387" alt="image" src="https://github.com/user-attachments/assets/9f301447-955a-4a9f-b8fe-5aaa75adfbad" />
+
+### <b>6. Pobierz paczkę danych BDOT10k</b>
+
+Pobiera aktualną paczkę danych BDOT10k dla wybranego powiatu.
+
+<img width="762" height="397" alt="image" src="https://github.com/user-attachments/assets/cf6b4517-cb82-4483-b025-d1fe3e787cfe" />
 
 ###### Nota końcowa:
 
