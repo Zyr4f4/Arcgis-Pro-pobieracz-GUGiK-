@@ -33,6 +33,27 @@ def load_teryt_db():
             TERYT_DB = False
     return TERYT_DB
 
+BDOT_DB = None
+
+def load_bdot_db():
+    global BDOT_DB
+    if BDOT_DB is None:
+        try:
+            try:
+                base_dir = os.path.dirname(os.path.abspath(__file__))
+            except NameError:
+                import inspect
+                base_dir = os.path.dirname(os.path.abspath(inspect.getfile(inspect.currentframe())))
+
+            db_path = os.path.join(base_dir, "slownik_bdot.json")
+            if os.path.exists(db_path):
+                with open(db_path, 'r', encoding='utf-8') as f:
+                    BDOT_DB = json.load(f)
+            else:
+                BDOT_DB = {}
+        except Exception:
+            BDOT_DB = {}
+    return BDOT_DB
 # ==============================================================================
 # DEDYKOWANE KLASY POMOCNICZE HTTP ORAZ WFS
 # ==============================================================================
@@ -179,7 +200,7 @@ class Toolbox(object):
     def __init__(self):
         self.label = "Pobierz dane GUGiK"
         self.alias = "GUGiK_tools"
-        self.tools = [PobierzDzialkeULDK, PobierzOrtofotomape, PobierzChmuryPunktow, PobierzNMTNMPT, PobierzSkorowidzEGIB]
+        self.tools = [PobierzDzialkeULDK, PobierzOrtofotomape, PobierzChmuryPunktow, PobierzNMTNMPT, PobierzSkorowidzEGIB, PobierzBDOT10k]
 
 # ==============================================================================
 # NARZĘDZIE 1: ULDK
@@ -1688,11 +1709,18 @@ class PobierzNMTNMPT(object):
 class PobierzSkorowidzEGIB(object):
     """
     Pobiera geometrie działek i/lub budynków z Usługi Zbiorczej WFS EGiB GUGiK
-    dla wskazanego obszaru za pomocą zapytań WFS 2.0.0 z automatycznym kafelkowaniem obszaru.
-    Raportuje postęp pobierania w paczkach po 100 obiektów.
+    dla wskazanego obszaru. Rozbija atrybuty WFS na dedykowane kolumny tabeli.
     """
 
     WFS_URL = "https://mapy.geoportal.gov.pl/wss/service/PZGIK/EGIB/WFS/UslugaZbiorcza"
+
+    # Tagi XML/GML do wykluczenia
+    IGNORED_TAGS = {
+        "boundedby", "envelope", "lowercorner", "uppercorner",
+        "poslist", "polygon", "multipolygon", "surface", "multisurface",
+        "exterior", "interior", "linearring", "patch", "patches",
+        "polygonpatch", "geometry", "geom", "the_geom", "shape"
+    }
 
     def __init__(self):
         self.label = "Pobierz obrys działek/budynków (WFS)"
@@ -1767,14 +1795,24 @@ class PobierzSkorowidzEGIB(object):
             p[4].enabled = False
 
     def _split_bbox(self, ext, tile_size=500.0):
-        """Dzieli zasięg (extent) na siatkę mniejszych BBOX-ów w metrach[cite: 4]."""
+        """Dzieli zasięg na siatkę mniejszych BBOX-ów w metrach."""
+        xmin, xmax = ext.XMin, ext.XMax
+        ymin, ymax = ext.YMin, ext.YMax
+
+        if xmin == xmax:
+            xmin -= 2.0
+            xmax += 2.0
+        if ymin == ymax:
+            ymin -= 2.0
+            ymax += 2.0
+
         bboxes = []
-        x = ext.XMin
-        while x < ext.XMax:
-            next_x = min(x + tile_size, ext.XMax)
-            y = ext.YMin
-            while y < ext.YMax:
-                next_y = min(y + tile_size, ext.YMax)
+        x = xmin
+        while x < xmax:
+            next_x = min(x + tile_size, xmax)
+            y = ymin
+            while y < ymax:
+                next_y = min(y + tile_size, ymax)
                 bboxes.append((x, y, next_x, next_y))
                 y = next_y
             x = next_x
@@ -1813,17 +1851,20 @@ class PobierzSkorowidzEGIB(object):
             local = feat.tag.split("}")[-1]
             if local in ("member", "featureMember"):
                 children = list(feat)
-                if not children: continue
+                if not children:
+                    continue
                 child_elem = children[0]
 
                 attrs = {}
                 wkt_geom = None
 
+                # Parsowanie geometrii
                 pos_lists = child_elem.findall(".//{*}posList")
                 if pos_lists:
                     rings = []
                     for pl in pos_lists:
-                        if not pl.text: continue
+                        if not pl.text:
+                            continue
                         coords = pl.text.strip().split()
                         pts = []
                         for i in range(0, len(coords), 2):
@@ -1835,15 +1876,36 @@ class PobierzSkorowidzEGIB(object):
                     if rings:
                         wkt_geom = f"POLYGON{rings[0]}" if len(rings) == 1 else f"MULTIPOLYGON({', '.join(rings)})"
 
+                # Parsowanie atrybutów
                 for child in child_elem.iter():
                     tag = child.tag.split("}")[-1]
+                    if tag.lower() in self.IGNORED_TAGS:
+                        continue
                     if not list(child) and child.text and child.text.strip():
-                        attrs[tag] = child.text.strip()
+                        attrs[tag.upper()] = child.text.strip()
 
                 if wkt_geom:
                     features_data.append((wkt_geom, attrs))
 
         return features_data
+
+    def _ensure_fields(self, out_fc, out_ws, field_names):
+        """Dodaje brakujące kolumny do warstwy docelowej."""
+        existing_fields = {f.name.upper(): f.name for f in arcpy.ListFields(out_fc)}
+        field_map = {}
+
+        for attr_name in field_names:
+            valid_name = arcpy.ValidateFieldName(attr_name, out_ws)
+            val_upper = valid_name.upper()
+
+            if val_upper not in existing_fields:
+                arcpy.management.AddField(out_fc, valid_name, "TEXT", field_length=100)
+                existing_fields[val_upper] = valid_name
+                field_map[attr_name] = valid_name
+            else:
+                field_map[attr_name] = existing_fields[val_upper]
+
+        return field_map
 
     def execute(self, p, messages):
         in_features = p[0].value
@@ -1866,13 +1928,13 @@ class PobierzSkorowidzEGIB(object):
         if not arcpy.Exists(out_fc):
             arcpy.CreateFeatureclass_management(out_ws, out_name, "POLYGON", spatial_reference=sr_2180)
             arcpy.management.AddField(out_fc, "ID_OBIEKTU", "TEXT", field_length=100)
-            arcpy.management.AddField(out_fc, "INFO", "TEXT", field_length=255)
             arcpy.AddMessage(f"Utworzono nową warstwę: {out_name}")
         else:
             try:
                 with arcpy.da.SearchCursor(out_fc, ["ID_OBIEKTU"]) as sc:
                     for r in sc:
-                        if r[0]: processed_ids.add(r[0])
+                        if r[0]:
+                            processed_ids.add(r[0])
                 arcpy.AddMessage(f"Warstwa '{out_name}' istnieje. Dopisywanie obiektów (wczytano {len(processed_ids)} istniejących).")
             except Exception as e:
                 arcpy.AddError(f"Błąd odczytu istniejącej warstwy: {e}")
@@ -1880,61 +1942,77 @@ class PobierzSkorowidzEGIB(object):
 
         src_sr = arcpy.Describe(in_features).spatialReference
         initial_count = len(processed_ids)
-        current_added = 0
 
         arcpy.AddMessage(f"Pobieranie obiektów z WFS EGiB ({type_name}). Rozpoczynam przetwarzanie...")
 
-        insert_fields = ["SHAPE@", "ID_OBIEKTU", "INFO"]
-        with arcpy.da.InsertCursor(out_fc, insert_fields) as cursor:
-            with arcpy.da.SearchCursor(in_features, ["SHAPE@"]) as search_cur:
-                for row in search_cur:
-                    input_geom = row[0]
-                    if not input_geom: continue
+        features_to_save = []
+        all_attr_keys = set()
 
-                    if src_sr and src_sr.factoryCode != 2180:
-                        input_geom = input_geom.projectAs(sr_2180)
+        with arcpy.da.SearchCursor(in_features, ["SHAPE@"]) as search_cur:
+            for row in search_cur:
+                input_geom = row[0]
+                if not input_geom:
+                    continue
 
-                    ext = input_geom.extent
-                    # Dzielimy obszar na kafelki 500x500 metrow[cite: 4]
-                    sub_bboxes = self._split_bbox(ext, tile_size=500.0)
+                if src_sr and src_sr.factoryCode != 2180:
+                    input_geom = input_geom.projectAs(sr_2180)
 
-                    for bbox in sub_bboxes:
-                        # Odrzucamy kafelki poza poligonem wejściowym[cite: 4]
-                        tile_poly = arcpy.Polygon(arcpy.Array([
-                            arcpy.Point(bbox[0], bbox[1]),
-                            arcpy.Point(bbox[0], bbox[3]),
-                            arcpy.Point(bbox[2], bbox[3]),
-                            arcpy.Point(bbox[2], bbox[1])
-                        ]), sr_2180)
+                ext = input_geom.extent
+                sub_bboxes = self._split_bbox(ext, tile_size=500.0)
 
-                        if input_geom.disjoint(tile_poly):
-                            continue
+                for bbox in sub_bboxes:
+                    tile_poly = arcpy.Polygon(arcpy.Array([
+                        arcpy.Point(bbox[0], bbox[1]),
+                        arcpy.Point(bbox[0], bbox[3]),
+                        arcpy.Point(bbox[2], bbox[3]),
+                        arcpy.Point(bbox[2], bbox[1])
+                    ]), sr_2180)
 
-                        try:
-                            features = self._get_wfs_features(bbox, type_name)
-                            for wkt, attrs in features:
-                                try:
-                                    poly_geom = arcpy.FromWKT(wkt, sr_2180)
+                    if input_geom.disjoint(tile_poly):
+                        continue
 
-                                    if poly_geom and not poly_geom.disjoint(input_geom):
-                                        obj_id = attrs.get("ID_DZIALKI", attrs.get("ID_BUDYNKU", attrs.get("gml_id", "Nieznany")))
+                    try:
+                        features = self._get_wfs_features(bbox, type_name)
+                        for wkt, attrs in features:
+                            try:
+                                poly_geom = arcpy.FromWKT(wkt, sr_2180)
 
-                                        if obj_id in processed_ids and obj_id != "Nieznany":
-                                            continue
+                                if poly_geom and not poly_geom.disjoint(input_geom):
+                                    obj_id = (
+                                        attrs.get("ID_DZIALKI") or
+                                        attrs.get("IDDZIALKI") or
+                                        attrs.get("ID_BUDYNKU") or
+                                        attrs.get("IDBUDYNKU") or
+                                        attrs.get("GML_ID") or
+                                        "Nieznany"
+                                    )
 
-                                        info = str(attrs)[:250]
-                                        cursor.insertRow((poly_geom, obj_id, info))
-                                        processed_ids.add(obj_id)
+                                    if obj_id in processed_ids and obj_id != "Nieznany":
+                                        continue
 
-                                        # Zliczanie pobranych i zapisanych obiektów z powiadomieniem co 100
-                                        current_added += 1
-                                        if current_added % 100 == 0:
-                                            arcpy.AddMessage(f"Pobrano i zapisano {current_added} obiektów ({typ_obj.lower()})...")
+                                    processed_ids.add(obj_id)
+                                    all_attr_keys.update(attrs.keys())
+                                    features_to_save.append((poly_geom, obj_id, attrs))
 
-                                except Exception as ge:
-                                    arcpy.AddWarning(f"Błąd geometrii obiektu: {ge}")
-                        except Exception as e:
-                            arcpy.AddWarning(f"Błąd zapytania WFS: {e}")
+                                    if len(features_to_save) % 100 == 0:
+                                        arcpy.AddMessage(f"Pobrano {len(features_to_save)} obiektów ({typ_obj.lower()})...")
+
+                            except Exception as ge:
+                                arcpy.AddWarning(f"Błąd geometrii obiektu: {ge}")
+                    except Exception as e:
+                        arcpy.AddWarning(f"Błąd zapytania WFS: {e}")
+
+        # Dodanie brakujących kolumn i zapis danych
+        if features_to_save:
+            field_map = self._ensure_fields(out_fc, out_ws, sorted(list(all_attr_keys)))
+            attr_cols = sorted(list(field_map.keys()))
+            db_cols = [field_map[col] for col in attr_cols]
+
+            insert_fields = ["SHAPE@", "ID_OBIEKTU"] + db_cols
+            with arcpy.da.InsertCursor(out_fc, insert_fields) as cursor:
+                for poly_geom, obj_id, attrs in features_to_save:
+                    row_vals = [poly_geom, obj_id] + [attrs.get(k) for k in attr_cols]
+                    cursor.insertRow(row_vals)
 
         added_count = len(processed_ids) - initial_count
         arcpy.AddMessage(f"Zakończono! Łącznie pobrano i dopisano obiektów: {added_count}")
@@ -1960,3 +2038,282 @@ class PobierzSkorowidzEGIB(object):
                     active_view.refresh()
         except Exception:
             pass
+
+# ==============================================================================
+# NARZĘDZIE 6: POBIERZ PACZKĘ BDOT10K DLA POWIATU (ZIP/SHP/GML)
+# ==============================================================================
+class PobierzBDOT10k(object):
+    BASE_URL = "https://opendata.geoportal.gov.pl/bdot10k/{fmt}/{woj_code}/{teryt}_{fmt}.{ext}"
+
+    def __init__(self):
+        self.label = "Pobierz paczkę BDOT10k"
+        self.description = "Pobiera paczki (SHP/GML) BDOT10k dla powiatów bezpośrednio z zasobów GUGiK."
+        self.canRunInBackground = False
+
+    def getParameterInfo(self):
+        param_format = arcpy.Parameter(
+            displayName="Format paczki",
+            name="format_paczki",
+            datatype="GPString",
+            parameterType="Required",
+            direction="Input"
+        )
+        param_format.filter.list = ["SHP", "GML"]
+        param_format.value = "SHP"
+
+        db = load_teryt_db()
+        woj_list = []
+        if db and isinstance(db, dict) and "wojewodztwa" in db:
+            woj_list = sorted([f"{v} ({k})" for k, v in db.get("wojewodztwa", {}).items()])
+
+        param_woj = arcpy.Parameter(
+            displayName="Województwo",
+            name="wojewodztwo",
+            datatype="GPString",
+            parameterType="Required",
+            direction="Input"
+        )
+        param_woj.filter.list = woj_list
+
+        param_pow = arcpy.Parameter(
+            displayName="Powiat",
+            name="powiat",
+            datatype="GPString",
+            parameterType="Required",
+            direction="Input"
+        )
+        param_pow.filter.list = []
+
+        param_out_dir = arcpy.Parameter(
+            displayName="Folder docelowy na pobrane paczki ZIP",
+            name="out_dir",
+            datatype="DEFolder",
+            parameterType="Required",
+            direction="Input"
+        )
+
+        param_process_all = arcpy.Parameter(
+            displayName="Wypakuj ZIP, dodaj warstwy do geobazy i okna aktywnej mapy (chwilę to trwa)",
+            name="process_all",
+            datatype="GPBoolean",
+            parameterType="Optional",
+            direction="Input"
+        )
+        param_process_all.value = True
+
+        param_out_ws = arcpy.Parameter(
+            displayName="Geobaza docelowa dla importu",
+            name="out_ws",
+            datatype="DEWorkspace",
+            parameterType="Optional",
+            direction="Input"
+        )
+        try:
+            if arcpy.env.workspace:
+                param_out_ws.value = arcpy.env.workspace
+        except Exception:
+            pass
+
+        param_overwrite = arcpy.Parameter(
+            displayName="Pobierz ponownie / nadpisz w geobazie, jeśli istnieje",
+            name="overwrite",
+            datatype="GPBoolean",
+            parameterType="Optional",
+            direction="Input"
+        )
+        param_overwrite.value = False
+
+        param_derived = arcpy.Parameter(
+            displayName="Ścieżka do pobranych danych (Ukryta)",
+            name="out_path",
+            datatype="DEFolder",
+            parameterType="Derived",
+            direction="Output"
+        )
+
+        return [
+            param_format, param_woj, param_pow,
+            param_out_dir, param_process_all, param_out_ws,
+            param_overwrite, param_derived
+        ]
+
+    def updateParameters(self, p):
+        is_shp = (p[0].valueAsText == "SHP")
+        process_all = bool(p[4].value)
+        p[5].enabled = process_all and is_shp
+
+        db = load_teryt_db()
+        if db:
+            woj_val = p[1].valueAsText
+            woj_id = woj_val.split('(')[-1].replace(')', '').strip() if woj_val and '(' in woj_val else None
+
+            pow_list = []
+            if woj_id and woj_id in db.get("powiaty", {}):
+                pow_list = sorted([f"{v} ({k})" for k, v in db["powiaty"][woj_id].items()])
+
+            if p[2].filter.list != pow_list:
+                p[2].filter.list = pow_list
+                if p[2].valueAsText and p[2].valueAsText not in pow_list:
+                    p[2].value = None
+
+    def _sanitize_and_rename_shp(self, folder_path, teryt):
+        processed_shp = []
+        for root_d, _, files in os.walk(folder_path):
+            file_bases = {}
+            for f in files:
+                dot_idx = f.rfind('.')
+                if dot_idx != -1:
+                    base = f[:dot_idx]
+                    ext = f[dot_idx:]
+                    file_bases.setdefault(base, []).append(ext)
+
+            for old_base, extensions in file_bases.items():
+                if ".shp" not in [e.lower() for e in extensions]:
+                    continue
+
+                if "__" in old_base:
+                    class_code = old_base.split("__")[-1].upper()
+                else:
+                    class_code = old_base.replace(".", "_").upper()
+
+                new_base = f"BDOT_{teryt}_{class_code}"
+
+                for ext in extensions:
+                    old_file = os.path.join(root_d, f"{old_base}{ext}")
+                    new_file = os.path.join(root_d, f"{new_base}{ext}")
+                    if old_file != new_file:
+                        if os.path.exists(new_file):
+                            os.remove(new_file)
+                        os.rename(old_file, new_file)
+
+                renamed_shp = os.path.join(root_d, f"{new_base}.shp")
+                if os.path.exists(renamed_shp):
+                    processed_shp.append((renamed_shp, class_code))
+
+        return processed_shp
+
+    def execute(self, p, messages):
+        fmt = (p[0].valueAsText or "SHP").upper()
+        pow_val = p[2].valueAsText
+        out_dir = p[3].valueAsText
+        process_all = p[4].value
+        out_ws = p[5].valueAsText
+        overwrite = p[6].value
+
+        if not pow_val:
+            return arcpy.AddError("Wybierz powiat z listy.")
+
+        teryt = pow_val.split('(')[-1].replace(')', '').strip()[:4]
+        pow_nazwa = pow_val.split('(')[0].strip()
+
+        bdot_raw = load_bdot_db()
+        if isinstance(bdot_raw, dict) and "slownik_klas" in bdot_raw:
+            bdot_dict = bdot_raw.get("slownik_klas", {})
+            layer_order = bdot_raw.get("kolejnosc_warstw", [])
+        else:
+            bdot_dict = bdot_raw if isinstance(bdot_raw, dict) else {}
+            layer_order = []
+
+        os.makedirs(out_dir, exist_ok=True)
+        arcpy.env.overwriteOutput = bool(overwrite)
+
+        woj_code = teryt[:2]
+        clean_pow_nazwa = re.sub(r'[\\/*?:"<>| ]', '_', pow_nazwa)
+        file_name = f"{teryt}_{clean_pow_nazwa}_{fmt}.zip"
+        zip_path = os.path.join(out_dir, file_name)
+
+        if os.path.exists(zip_path) and not overwrite:
+            messages.addMessage(f"Plik istnieje, pomijam pobieranie: {file_name}")
+        else:
+            download_successful = False
+            for ext in ["zip", "ZIP"]:
+                url = self.BASE_URL.format(fmt=fmt, woj_code=woj_code, teryt=teryt, ext=ext)
+                try:
+                    messages.addMessage(f"Pobieranie paczki: {file_name}...")
+                    HttpClient.download_stream(url, zip_path, messages=messages)
+                    download_successful = True
+                    break
+                except Exception:
+                    continue
+
+            if not download_successful:
+                return arcpy.AddError(f"Nie udało się pobrać paczki dla powiatu {pow_nazwa} ({teryt}).")
+
+        if process_all and zip_path.lower().endswith(".zip") and zipfile.is_zipfile(zip_path):
+            folder_name = f"{teryt}_{clean_pow_nazwa}_BDOT10k_{fmt}"
+            target_extract_path = os.path.join(out_dir, folder_name)
+            messages.addMessage(f"Wypakowywanie do: {target_extract_path}...")
+            os.makedirs(target_extract_path, exist_ok=True)
+
+            with zipfile.ZipFile(zip_path, 'r') as z:
+                z.extractall(target_extract_path)
+
+            renamed_shp_list = self._sanitize_and_rename_shp(target_extract_path, teryt)
+
+            if layer_order:
+                def get_order(item):
+                    code = item[1]
+                    return layer_order.index(code) if code in layer_order else 9999
+                renamed_shp_list.sort(key=get_order)
+
+            if fmt == "SHP" and out_ws and arcpy.Exists(out_ws):
+                valid_shp_list = [item for item in renamed_shp_list if os.path.getsize(item[0]) > 104]
+                total_valid = len(valid_shp_list)
+                messages.addMessage(f"Importowanie {total_valid} plików SHP do geobazy: {out_ws}...")
+                imported_layers = []
+
+                for idx, (shp_full, class_code) in enumerate(valid_shp_list, 1):
+                    opis_klasy = bdot_dict.get(class_code, "Obiekt topograficzny")
+                    layer_display_name = f"[{class_code}] {opis_klasy}"
+
+                    fc_name = arcpy.ValidateTableName(f"BDOT_{teryt}_{class_code}", out_ws)
+                    out_fc_path = os.path.join(out_ws, fc_name)
+
+                    if not arcpy.Exists(out_fc_path) or overwrite:
+                        try:
+                            count = int(arcpy.management.GetCount(shp_full)[0])
+                            if count > 0:
+                                arcpy.conversion.ExportFeatures(
+                                    in_features=shp_full,
+                                    out_features=out_fc_path
+                                )
+                                imported_layers.append((out_fc_path, layer_display_name))
+                                messages.addMessage(f"  [{idx}/{total_valid}] Zaimportowano: {fc_name} ({count} obiektów)")
+                        except Exception as imp_err:
+                            messages.addWarningMessage(f"  [{idx}/{total_valid}] Pominięto warstwę {os.path.basename(shp_full)}: {imp_err}")
+                    else:
+                        imported_layers.append((out_fc_path, layer_display_name))
+                        messages.addMessage(f"  [{idx}/{total_valid}] Istnieje w bazie: {fc_name}")
+
+                messages.addMessage(f"Zaimportowano łącznie {len(imported_layers)} niepustych warstw do geobazy.")
+
+                if imported_layers:
+                    try:
+                        aprx = arcpy.mp.ArcGISProject("CURRENT")
+                        active_map = aprx.activeMap
+                        if active_map:
+                            group_name = f"BDOT10k - {pow_nazwa} ({teryt})"
+                            group_layer = active_map.createGroupLayer(group_name)
+
+                            group_layer.visible = False
+
+                            for l_idx, (fc_path, disp_name) in enumerate(imported_layers, 1):
+                                added_lyr = active_map.addDataFromPath(fc_path)
+                                added_lyr.name = disp_name
+                                added_lyr.visible = False
+                                active_map.addLayerToGroup(group_layer, added_lyr, "TOP")
+                                active_map.removeLayer(added_lyr)
+                                messages.addMessage(f"  Dodano do TOC [{l_idx}/{len(imported_layers)}]: {disp_name}")
+
+                            for lyr in group_layer.listLayers():
+                                lyr.visible = True
+                            group_layer.visible = True
+
+                            messages.addMessage(f"Utworzono grupę '{group_name}' i włączono widoczność wszystkich warstw.")
+                    except Exception as map_err:
+                        messages.addWarningMessage(f"Nie udało się dodać warstw do widoku mapy: {map_err}")
+
+        if len(p) > 7:
+            p[7].value = out_dir
+
+        messages.addMessage("Zakończono pomyślnie!")
