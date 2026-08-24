@@ -24,6 +24,10 @@ Następnie PPM na samym przyborniku -> Dodaj do nowych projektów. Dzięki temu 
 
 <img width="404" height="501" alt="image" src="https://github.com/user-attachments/assets/5d2a8b58-4ff6-4218-9f61-23b9c84e9639" />
 
+W przypadku problemów z działaniem wtyczki należy przejść do panelu opcje -> geoprzetwarzanie i odznaczyć opcję Analizuj narzędzia skryptów i modeli z uwagi na zgodność z aplikacją ArcGIS Pro.
+
+<img width="879" height="805" alt="image" src="https://github.com/user-attachments/assets/b3132193-2d7b-4b36-a3cf-f6fd420f9171" />
+
 --------------------------------------------------------
 ## <b>ZAWARTOSĆ PRZYBORNIKA</b>
 
