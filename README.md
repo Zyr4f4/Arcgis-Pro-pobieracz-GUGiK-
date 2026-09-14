@@ -7,7 +7,10 @@ W środku znajdziesz narzędzia pozwalające na pobranie:
 - Ortofotomapy
 - NMT/NMPT
 - Chmur punktów
-- Aktualnych paczek danych BDOT10k
+- Aktualnych paczek BDOT10k
+- Archiwalnych paczek BDOT10k
+- Punktów adresowych (KINA)
+- Osi ulic (KINA)
 
 --------------------------------------------------------
 ### <b> Instalacja </b>
@@ -18,7 +21,7 @@ Pobierz kod ze strony:
 
 Wypakuj pobrane archiwum. Aby dodać toolboxa do projektu należy w panelu katalog kliknąć PPM na Tolboxes i wybrać opcję Add Toolbox. 
 
-<img width="767" height="432" alt="image" src="https://github.com/user-attachments/assets/289af5cf-0ee6-4a67-bbbe-36e65665e790" />
+<img width="723" height="467" alt="image" src="https://github.com/user-attachments/assets/7c0c1eb7-211c-4d40-83bd-2c0eaf2ab434" />
 
 Następnie PPM na samym przyborniku -> Dodaj do nowych projektów. Dzięki temu nie będzie potrzeby dodawać go za każdym razem ponownie.
 
@@ -82,9 +85,27 @@ Dane pobierane są po wyborze układu wysokościowego. Aby dodać dane do okna m
 
 ### <b>6. Pobierz paczkę danych BDOT10k</b>
 
-Pobiera aktualną paczkę danych BDOT10k dla wybranego powiatu.
+Pobiera aktualną paczkę danych BDOT10k dla wybranego powiatu w .shp/.gml. Przy pobieraniu .shp istnieje możliwość automatycznego dodania warstw do geobazy i okna mapy. 
 
 <img width="762" height="397" alt="image" src="https://github.com/user-attachments/assets/cf6b4517-cb82-4483-b025-d1fe3e787cfe" />
+
+### <b>7. Pobierz archiwalną paczkę BDOT10k</b>
+
+Pobiera archiwalną paczkę danych BDOT10k dla wybranego powiatu w .shp/.gml. Przy pobieraniu .shp istnieje możliwość automatycznego dodania warstw do geobazy i okna mapy. 
+
+<img width="713" height="337" alt="image" src="https://github.com/user-attachments/assets/3d033313-097c-4931-b252-6c18ee5a84b1" />
+
+### <b>8. Pobierz osie ulic</b>
+
+Pobiera osie ulic udostępniane poprzez Krajową Integrację Numeracji Adresowej. Do wyboru pobieranie za pomocą istniejącej warstwy\narzędzie odręcznego lub TERYTu.
+
+<img width="715" height="350" alt="image" src="https://github.com/user-attachments/assets/907e42c2-b10c-413b-8916-b37aad861d0a" />
+
+### <b>9. Pobierz punkty adresowe</b>
+
+Pobiera punkty adresowe udostępniane poprzez Krajową Integrację Numeracji Adresowej. Do wyboru pobieranie za pomocą istniejącej warstwy\narzędzie odręcznego lub TERYTu.
+
+<img width="715" height="359" alt="image" src="https://github.com/user-attachments/assets/30bf9b90-7f61-4d98-b0ca-8f4976e02559" />
 
 ###### Nota końcowa:
 
