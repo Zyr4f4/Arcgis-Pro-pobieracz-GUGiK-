@@ -61,7 +61,8 @@ Pozwala na pobieranie ortofotomapy wg następujących kryteriów:
   Zaznaczenie wszystkich lat skorowidzów pozwala na pobranie wszystkich materiałów dla wybranego obszaru.
   Po pobraniu można utworzyć mozaikę z pobranych materiałów i obliczyć jej statystyki.
   
-<img width="774" height="836" alt="image" src="https://github.com/user-attachments/assets/332556f5-7b96-4293-9e6d-ccba8cd45750" />
+<img width="694" height="569" alt="image" src="https://github.com/user-attachments/assets/4fad2edc-ce62-40cd-a818-8c4b4e5d5644" />
+
 
 ### <b>4. Pobierz NMT/NMPT</b>
 
