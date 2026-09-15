@@ -12,7 +12,7 @@ W środku znajdziesz narzędzia pozwalające na pobranie:
 - Punktów adresowych (KINA)
 - Osi ulic (KINA)
 
-Pełny opis narzędzi tutaj: [Zawartość przybornika](#zawartość-przybornika)
+#### Pełny opis poszczególnych narzędzi niżej
 --------------------------------------------------------
 ### <b> Instalacja </b>
 
@@ -99,13 +99,13 @@ Pobiera archiwalną paczkę danych BDOT10k dla wybranego powiatu w .shp/.gml. Pr
 
 ### <b>8. Pobierz osie ulic</b>
 
-Pobiera osie ulic udostępniane poprzez Krajową Integrację Numeracji Adresowej. Do wyboru pobieranie za pomocą istniejącej warstwy\narzędzie odręcznego lub TERYTu.
+Pobiera osie ulic udostępniane poprzez Krajową Integrację Numeracji Adresowej. Do wyboru pobieranie za pomocą istniejącej warstwy\narzędzia odręcznego lub TERYTu.
 
 <img width="715" height="350" alt="image" src="https://github.com/user-attachments/assets/907e42c2-b10c-413b-8916-b37aad861d0a" />
 
 ### <b>9. Pobierz punkty adresowe</b>
 
-Pobiera punkty adresowe udostępniane poprzez Krajową Integrację Numeracji Adresowej. Do wyboru pobieranie za pomocą istniejącej warstwy\narzędzie odręcznego lub TERYTu.
+Pobiera punkty adresowe udostępniane poprzez Krajową Integrację Numeracji Adresowej. Do wyboru pobieranie za pomocą istniejącej warstwy\narzędzia odręcznego lub TERYTu.
 
 <img width="715" height="359" alt="image" src="https://github.com/user-attachments/assets/30bf9b90-7f61-4d98-b0ca-8f4976e02559" />
 
