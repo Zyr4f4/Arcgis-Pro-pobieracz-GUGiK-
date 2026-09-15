@@ -12,6 +12,7 @@ W środku znajdziesz narzędzia pozwalające na pobranie:
 - Punktów adresowych (KINA)
 - Osi ulic (KINA)
 
+Pełny opis narzędzi tutaj: [Zawartość przybornika](https://github.com/Zyr4f4/Arcgis-Pro-pobieracz-GUGiK-#zawarto%C5%9B%C4%87-przybornika)
 --------------------------------------------------------
 ### <b> Instalacja </b>
 
