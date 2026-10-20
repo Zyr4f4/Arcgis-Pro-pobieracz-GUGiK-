@@ -3,16 +3,20 @@ import arcpy
 import os
 import re
 import zipfile
-from src.utils import HttpClient, load_teryt_db, load_bdot_db
+import datetime
+from src.utils import FileDownloader, ToolCancelled, load_teryt_db, load_bdot_db
 
 
 class PobierzArchiwalnyBDOT10kImpl(object):
-    # Struktura oparta dokładnie na podanych adresach
     URL_TEMPLATE = "https://opendata.geoportal.gov.pl/Archiwum/bdot10k/{year}/{fmt}/{woj_code}/{teryt}_{fmt}_{year}.zip"
-    DOWNLOAD_TIMEOUT = 90
-    AVAILABLE_YEARS = ["2023", "2022", "2021", "2020", "2019", "2018", "2017", "2016", "2015", "2014"]
+
+    def __init__(self):
+        self.downloader = FileDownloader()
 
     def getParameterInfo(self):
+        current_year = datetime.datetime.now().year
+        available_years = [str(r) for r in range(current_year - 1, 2013, -1)]
+
         param_year = arcpy.Parameter(
             displayName="Stan na koniec roku",
             name="rok",
@@ -20,8 +24,8 @@ class PobierzArchiwalnyBDOT10kImpl(object):
             parameterType="Required",
             direction="Input"
         )
-        param_year.filter.list = self.AVAILABLE_YEARS
-        param_year.value = "2023"
+        param_year.filter.list = available_years
+        param_year.value = available_years[0] if available_years else "2023"
 
         param_format = arcpy.Parameter(
             displayName="Format paczki",
@@ -111,8 +115,6 @@ class PobierzArchiwalnyBDOT10kImpl(object):
 
     def updateParameters(self, p):
         is_shp = (p[1].valueAsText == "SHP")
-
-        # Blokada opcji importu i geobazy przy wyborze formatu GML
         if not is_shp:
             p[5].value = False
             p[5].enabled = False
@@ -204,144 +206,121 @@ class PobierzArchiwalnyBDOT10kImpl(object):
             layer_order = []
 
         os.makedirs(out_dir, exist_ok=True)
-
         clean_pow_nazwa = re.sub(r'[\\/*?:"<>| ]', '_', pow_nazwa)
         file_name = f"{teryt}_{clean_pow_nazwa}_{fmt}_{year}.zip"
-        zip_path = os.path.join(out_dir, file_name)
+        url = self.URL_TEMPLATE.format(year=year, fmt=fmt, woj_code=woj_code, teryt=teryt)
 
         arcpy.SetProgressor("step", f"Pobieranie archiwalnej paczki BDOT10k ({year})...", 0, 1, 1)
-
-        if os.path.exists(zip_path) and not overwrite and zipfile.is_zipfile(zip_path):
-            messages.addMessage(f"Plik istnieje, pomijam pobieranie: {file_name}")
+        try:
+            zip_path = self.downloader.download(
+                url=url,
+                out_folder=out_dir,
+                target_filename=file_name,
+                overwrite=overwrite,
+                check_type="zip"
+            )
             arcpy.SetProgressorPosition(1)
-        else:
-            url = self.URL_TEMPLATE.format(year=year, fmt=fmt, woj_code=woj_code, teryt=teryt)
-            messages.addMessage(f"Pobieranie z: {url}")
+        except ToolCancelled:
+            return arcpy.AddWarning("Przerwano przez użytkownika.")
+        except Exception as e:
+            return arcpy.AddError(f"Nie udało się pobrać paczki archiwalnej za rok {year} dla powiatu {pow_nazwa} ({teryt}): {e}")
 
-            download_ok = False
-            try:
-                HttpClient.download_stream(url, zip_path, messages=messages, timeout=self.DOWNLOAD_TIMEOUT)
-                if zipfile.is_zipfile(zip_path):
-                    download_ok = True
-            except Exception as e:
-                messages.addWarningMessage(f"Błąd pobierania: {e}")
-
-            if not download_ok or not zipfile.is_zipfile(zip_path):
-                if os.path.exists(zip_path):
-                    try:
-                        os.remove(zip_path)
-                    except Exception:
-                        pass
-                return arcpy.AddError(f"Nie udało się pobrać paczki archiwalnej za rok {year} dla powiatu {pow_nazwa} ({teryt}) spod adresu: {url}")
-
-            arcpy.SetProgressorPosition(1)
-
-        # GML – pobieranie do ZIP i zakończenie operacji
-        if fmt == "GML":
-            if len(p) > 8:
-                p[8].value = out_dir
-            arcpy.ResetProgressor()
-            messages.addMessage(f"Paczka archiwalna GML ({year}) została pobrana: {zip_path}")
-            messages.addMessage("Zakończono pomyślnie!")
-            return
-
-        if not process_all:
+        if fmt == "GML" or not process_all:
             if len(p) > 8:
                 p[8].value = out_dir
             arcpy.ResetProgressor()
             messages.addMessage("Zakończono pomyślnie!")
             return
 
-        # SHP – rozpakowanie i import do geobazy
-        if zip_path.lower().endswith(".zip") and zipfile.is_zipfile(zip_path):
-            folder_name = f"{teryt}_{clean_pow_nazwa}_BDOT10k_{fmt}_{year}"
-            target_extract_path = os.path.join(out_dir, folder_name)
+        # Wypakowanie i import SHP
+        folder_name = f"{teryt}_{clean_pow_nazwa}_BDOT10k_{fmt}_{year}"
+        target_extract_path = os.path.join(out_dir, folder_name)
+
+        already_extracted = os.path.exists(target_extract_path) and any(os.scandir(target_extract_path))
+        if not already_extracted or overwrite:
             messages.addMessage(f"Wypakowywanie do: {target_extract_path}...")
             os.makedirs(target_extract_path, exist_ok=True)
-
             with zipfile.ZipFile(zip_path, 'r') as z:
                 z.extractall(target_extract_path)
+        else:
+            messages.addMessage(f"Używam istniejącego folderu z danymi: {folder_name}")
 
-            if out_ws and arcpy.Exists(out_ws):
-                renamed_shp_list = self._sanitize_and_rename_shp(target_extract_path, teryt, year)
+        if out_ws and arcpy.Exists(out_ws):
+            renamed_shp_list = self._sanitize_and_rename_shp(target_extract_path, teryt, year)
 
-                if layer_order:
-                    def get_order(item):
-                        code = item[1]
-                        return layer_order.index(code) if code in layer_order else 9999
-                    renamed_shp_list.sort(key=get_order)
+            if layer_order:
+                def get_order(item):
+                    code = item[1]
+                    return layer_order.index(code) if code in layer_order else 9999
+                renamed_shp_list.sort(key=get_order)
 
-                valid_shp_list = [item for item in renamed_shp_list if os.path.getsize(item[0]) > 104]
-                total_valid = len(valid_shp_list)
+            valid_shp_list = [item for item in renamed_shp_list if os.path.getsize(item[0]) > 104]
+            total_valid = len(valid_shp_list)
 
-                total_pipeline_steps = 2 + (total_valid * 2)
-                current_step = 2
+            total_pipeline_steps = total_valid * 2
+            current_step = 0
+            arcpy.SetProgressor("step", f"Przetwarzanie BDOT10k {year} (0/{total_valid})...", 0, total_pipeline_steps, 1)
 
-                arcpy.SetProgressor("step", f"Przetwarzanie BDOT10k {year} (0/{total_valid})...", 0, total_pipeline_steps, 1)
+            messages.addMessage(f"Importowanie {total_valid} plików SHP do geobazy: {out_ws}...")
+            imported_layers = []
+
+            for idx, (shp_full, class_code) in enumerate(valid_shp_list, 1):
+                if self.downloader.is_cancelled():
+                    arcpy.AddWarning("Przerwano przez użytkownika.")
+                    break
+
+                opis_klasy = bdot_dict.get(class_code, "Obiekt topograficzny")
+                layer_display_name = f"[{class_code}] {opis_klasy} ({year})"
+                fc_name = arcpy.ValidateTableName(f"BDOT_{teryt}_{year}_{class_code}", out_ws)
+                out_fc_path = os.path.join(out_ws, fc_name)
+
+                arcpy.SetProgressorLabel(f"Import do GDB [{idx}/{total_valid}]: {fc_name}")
+
+                if not arcpy.Exists(out_fc_path) or overwrite:
+                    try:
+                        count = int(arcpy.management.GetCount(shp_full)[0])
+                        if count > 0:
+                            arcpy.conversion.ExportFeatures(in_features=shp_full, out_features=out_fc_path)
+                            imported_layers.append((out_fc_path, layer_display_name))
+                            messages.addMessage(f"  [{idx}/{total_valid}] Zaimportowano: {fc_name} ({count} obiektów)")
+                    except Exception as imp_err:
+                        messages.addWarningMessage(f"  [{idx}/{total_valid}] Pominięto warstwę {os.path.basename(shp_full)}: {imp_err}")
+                else:
+                    imported_layers.append((out_fc_path, layer_display_name))
+                    messages.addMessage(f"  [{idx}/{total_valid}] Istnieje w bazie: {fc_name}")
+
+                current_step += 1
                 arcpy.SetProgressorPosition(current_step)
 
-                messages.addMessage(f"Importowanie {total_valid} plików SHP do geobazy: {out_ws}...")
-                imported_layers = []
+            messages.addMessage(f"Zaimportowano łącznie {len(imported_layers)} warstw do geobazy.")
 
-                for idx, (shp_full, class_code) in enumerate(valid_shp_list, 1):
-                    opis_klasy = bdot_dict.get(class_code, "Obiekt topograficzny")
-                    layer_display_name = f"[{class_code}] {opis_klasy} ({year})"
+            if imported_layers:
+                try:
+                    aprx = arcpy.mp.ArcGISProject("CURRENT")
+                    active_map = aprx.activeMap
+                    if active_map:
+                        group_name = f"BDOT10k {year} - {pow_nazwa} ({teryt})"
+                        group_layer = active_map.createGroupLayer(group_name)
+                        group_layer.visible = False
 
-                    fc_name = arcpy.ValidateTableName(f"BDOT_{teryt}_{year}_{class_code}", out_ws)
-                    out_fc_path = os.path.join(out_ws, fc_name)
+                        for l_idx, (fc_path, disp_name) in enumerate(imported_layers, 1):
+                            arcpy.SetProgressorLabel(f"Dodawanie do mapy [{l_idx}/{len(imported_layers)}]: {disp_name}")
+                            added_lyr = active_map.addDataFromPath(fc_path)
+                            added_lyr.name = disp_name
+                            added_lyr.visible = False
+                            # TOP wypycha kolejne warstwy w górę: poligony lądują na spodzie, linie w środku, a punkty na samej górze
+                            active_map.addLayerToGroup(group_layer, added_lyr, "TOP")
+                            active_map.removeLayer(added_lyr)
 
-                    arcpy.SetProgressorLabel(f"Import do GDB [{idx}/{total_valid}]: {fc_name}")
+                            current_step += 1
+                            arcpy.SetProgressorPosition(current_step)
 
-                    if not arcpy.Exists(out_fc_path) or overwrite:
-                        try:
-                            count = int(arcpy.management.GetCount(shp_full)[0])
-                            if count > 0:
-                                arcpy.conversion.ExportFeatures(
-                                    in_features=shp_full,
-                                    out_features=out_fc_path
-                                )
-                                imported_layers.append((out_fc_path, layer_display_name))
-                                messages.addMessage(f"  [{idx}/{total_valid}] Zaimportowano: {fc_name} ({count} obiektów)")
-                        except Exception as imp_err:
-                            messages.addWarningMessage(f"  [{idx}/{total_valid}] Pominięto warstwę {os.path.basename(shp_full)}: {imp_err}")
-                    else:
-                        imported_layers.append((out_fc_path, layer_display_name))
-                        messages.addMessage(f"  [{idx}/{total_valid}] Istnieje w bazie: {fc_name}")
-
-                    current_step += 1
-                    arcpy.SetProgressorPosition(current_step)
-
-                messages.addMessage(f"Zaimportowano łącznie {len(imported_layers)} warstw do geobazy.")
-
-                if imported_layers:
-                    try:
-                        aprx = arcpy.mp.ArcGISProject("CURRENT")
-                        active_map = aprx.activeMap
-                        if active_map:
-                            group_name = f"BDOT10k {year} - {pow_nazwa} ({teryt})"
-                            group_layer = active_map.createGroupLayer(group_name)
-                            group_layer.visible = False
-
-                            for l_idx, (fc_path, disp_name) in enumerate(imported_layers, 1):
-                                arcpy.SetProgressorLabel(f"Dodawanie do mapy [{l_idx}/{len(imported_layers)}]: {disp_name}")
-                                added_lyr = active_map.addDataFromPath(fc_path)
-                                added_lyr.name = disp_name
-                                added_lyr.visible = False
-                                active_map.addLayerToGroup(group_layer, added_lyr, "TOP")
-                                active_map.removeLayer(added_lyr)
-
-                                current_step += 1
-                                arcpy.SetProgressorPosition(current_step)
-
-                            for lyr in group_layer.listLayers():
-                                lyr.visible = True
-                            group_layer.visible = True
-
-                            messages.addMessage(f"Utworzono grupę '{group_name}' i włączono widoczność warstw.")
-                    except Exception as map_err:
-                        messages.addWarningMessage(f"Nie udało się dodać warstw do mapy: {map_err}")
-
-                arcpy.SetProgressorPosition(total_pipeline_steps)
+                        for lyr in group_layer.listLayers():
+                            lyr.visible = True
+                        group_layer.visible = True
+                        messages.addMessage(f"Utworzono grupę '{group_name}' i włączono widoczność warstw.")
+                except Exception as map_err:
+                    messages.addWarningMessage(f"Nie udało się dodać warstw do mapy: {map_err}")
 
         if len(p) > 8:
             p[8].value = out_dir

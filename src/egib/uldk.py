@@ -2,7 +2,7 @@
 import arcpy
 import os
 import re
-from src.utils import HttpClient, load_teryt_db
+from src.utils import HttpClient, load_teryt_db, ToolCancelled
 
 
 def extract_id(val):
@@ -40,7 +40,7 @@ class PobierzDzialkeULDKImpl(object):
             direction="Input"
         )
         param_typ.filter.list = ["Działka", "Obręb", "Gmina", "Powiat", "Województwo"]
-        param_typ.value = "Powiat"
+        param_typ.value = "Działka"
 
         param_point = arcpy.Parameter(
             displayName="Wskaż obiekt na mapie (ołówek)",
@@ -96,7 +96,7 @@ class PobierzDzialkeULDKImpl(object):
         param_obr.filter.list = ["(Ładowanie słownika...)"]
 
         param_dz_nr = arcpy.Parameter(
-            displayName="Arkusz + Numer działki np. AR_6.1/7",
+            displayName="Arkusz + Numer działki np. AR_6.1/7 lub 123/4",
             name="dzialka_nr",
             datatype="GPString",
             parameterType="Optional",
@@ -169,6 +169,30 @@ class PobierzDzialkeULDKImpl(object):
         if len(p) > 11:
             p[11].enabled = False
 
+        if is_list and p[1].valueAsText == "Działka" and p[8].valueAsText:
+            pattern_nr = re.compile(r"^(?:[a-zA-Z0-9_]+\.)?[0-9]+([/-][0-9]+)?$")
+            invalid_nrs = []
+            for item in p[8].valueAsText.split(","):
+                val = item.strip().replace(" ", "")
+                if val and not pattern_nr.match(val):
+                    invalid_nrs.append(item.strip())
+            if invalid_nrs:
+                p[8].setErrorMessage(f"Wykryto błędny numer działki: {', '.join(invalid_nrs)} (poprawny format to np. 123, 123/4 lub AR_6.1/7)")
+            else:
+                p[8].clearMessage()
+
+        if is_teryt and p[3].valueAsText:
+            pattern_teryt = re.compile(r"^\d{4,8}(?:_\d)?(?:\.\d{4})?(?:\.(?:[a-zA-Z0-9_]+\.)?[0-9]+([/-][0-9]+)?)?$")
+            invalid_ids = []
+            for item in p[3].valueAsText.split(","):
+                val = item.strip().replace(" ", "")
+                if val and not pattern_teryt.match(val):
+                    invalid_ids.append(item.strip())
+            if invalid_ids:
+                p[3].setErrorMessage(f"Wykryto błędny identyfikator TERYT: {', '.join(invalid_ids)} (poprawny format to np. 141201_1.0001.1867/2)")
+            else:
+                p[3].clearMessage()
+
         if is_list:
             db = load_teryt_db()
             if not db:
@@ -215,7 +239,7 @@ class PobierzDzialkeULDKImpl(object):
                     p[7].value = None
 
     def execute(self, p, messages):
-        arcpy.AddMessage("--- Uruchomiono pobieranie ULDK ---")
+        messages.addMessage("--- Uruchomiono pobieranie ULDK ---")
         method = p[0].valueAsText
         typ_obiektu = p[1].valueAsText
         point_fs = p[2].value
@@ -230,14 +254,13 @@ class PobierzDzialkeULDKImpl(object):
         out_ws = p[9].valueAsText
         raw_out_name = p[10].valueAsText
 
-        # Zachowanie polskich znaków diakrytycznych
         safe_name = re.sub(r'[^\w]', '_', raw_out_name)
         if safe_name and safe_name[0].isdigit():
             safe_name = "L_" + safe_name
 
         out_name = arcpy.ValidateTableName(safe_name, out_ws)
         if out_name != raw_out_name:
-            arcpy.AddMessage(f"Skorygowano nazwę warstwy do: '{out_name}'")
+            messages.addMessage(f"Skorygowano nazwę warstwy do: '{out_name}'")
 
         out_fc = os.path.join(out_ws, out_name)
         url_base = "https://uldk.gugik.gov.pl/"
@@ -270,7 +293,7 @@ class PobierzDzialkeULDKImpl(object):
                     for row in search_cursor:
                         if row[0]:
                             processed_ids.add(str(row[0]).strip())
-                arcpy.AddMessage(f"Wczytano {len(processed_ids)} wcześniej pobranych obiektów z warstwy.")
+                messages.addMessage(f"Wczytano {len(processed_ids)} wcześniej pobranych obiektów z warstwy.")
             except Exception as e:
                 arcpy.AddError(f"Warstwa istnieje, ale ma nieprawidłową strukturę: {e}")
                 return
@@ -278,7 +301,6 @@ class PobierzDzialkeULDKImpl(object):
         initial_count = len(processed_ids)
         insert_fields = ["SHAPE@", "ID_TERYT", "TYP_OBIEKTU", "WOJEWODZTWO", "POWIAT", "GMINA", "OBREB", "NUMER_DZIALKI", "NAZWA"]
 
-        # Przygotowanie kolejki zapytań do obliczenia łącznej liczby kroków progressora
         queries = []
         if method == "Kliknięcie na mapie":
             if not point_fs:
@@ -289,14 +311,16 @@ class PobierzDzialkeULDKImpl(object):
                     if row[0] and None not in row[0]:
                         xy = f"{row[0][0]},{row[0][1]}" if str(srid) == "2180" else f"{row[0][0]},{row[0][1]},{srid}"
                         url = f"{url_base}?request=Get{api_endpoint}ByXY&xy={xy}&result={result_param}"
-                        queries.append((url, f"Punkt: {xy}"))
+                        queries.append((url, f"Punkt ({xy})"))
 
         elif method == "Identyfikator TERYT":
             if not parcel_id:
                 return arcpy.AddError("Proszę podać identyfikator.")
-            for p_id in [i.strip() for i in parcel_id.split(',') if i.strip()]:
-                url = f"{url_base}?request=Get{api_endpoint}ById&id={p_id}&result={result_param}"
-                queries.append((url, p_id))
+            for p_id in parcel_id.split(','):
+                clean_id = p_id.strip().replace(" ", "").replace("-", "/")
+                if clean_id:
+                    url = f"{url_base}?request=Get{api_endpoint}ById&id={clean_id}&result={result_param}"
+                    queries.append((url, clean_id))
 
         elif method == "Kaskadowy wybór z listy (Woj -> Pow -> Gmi -> Obr)":
             db = load_teryt_db()
@@ -307,10 +331,11 @@ class PobierzDzialkeULDKImpl(object):
                 if not obr_id or not dz_nr_val:
                     return arcpy.AddError("Do pobrania działek niezbędne jest wybranie obrębu oraz numeru działki.")
                 for nr in dz_nr_val.split(','):
-                    clean_nr = nr.strip()
+                    raw_nr = nr.strip()
+                    clean_nr = raw_nr.replace(" ", "").replace("-", "/")
                     if clean_nr:
                         url = f"{url_base}?request=GetParcelById&id={obr_id}.{clean_nr}&result={result_param}"
-                        queries.append((url, f"{obr_id}.{clean_nr}"))
+                        queries.append((url, raw_nr))
             else:
                 to_fetch = []
                 if typ_obiektu == "Województwo":
@@ -357,7 +382,7 @@ class PobierzDzialkeULDKImpl(object):
                         return arcpy.AddError("Aby pobrać obręby, wskaż co najmniej powiat lub gminę.")
 
                 for unit_id, unit_name in to_fetch:
-                    clean_id = str(unit_id).strip()
+                    clean_id = str(unit_id).strip().replace(" ", "")
                     url = f"{url_base}?request=Get{api_endpoint}ById&id={clean_id}&result={result_param}"
                     queries.append((url, f"{unit_name} ({clean_id})"))
 
@@ -365,19 +390,26 @@ class PobierzDzialkeULDKImpl(object):
         if total_queries == 0:
             return arcpy.AddWarning("Brak obiektów spełniających podane kryteria do odpytania.")
 
-        # Total steps = liczba zapytań + 1 krok na finalizację widoku mapy
         total_steps = total_queries + 1
         current_step = 0
-        arcpy.SetProgressor("step", f"Pobieranie danych ULDK (0/{total_queries})...", 0, total_steps, 1)
+        arcpy.SetProgressor("step", f"Pobieranie obiektów ULDK (0/{total_queries})...", 0, total_steps, 1)
 
-        with arcpy.da.InsertCursor(out_fc, insert_fields) as cursor:
-            for idx, (url, item_label) in enumerate(queries, start=1):
-                arcpy.SetProgressorLabel(f"Pobieranie [{idx}/{total_queries}]: {item_label}")
-                full_extent = self.fetch_and_insert(url, cursor, processed_ids, full_extent, sr_2180, typ_obiektu, errors)
-                current_step += 1
-                arcpy.SetProgressorPosition(current_step)
+        try:
+            with arcpy.da.InsertCursor(out_fc, insert_fields) as cursor:
+                for idx, (url, item_label) in enumerate(queries, start=1):
+                    if HttpClient.is_cancelled():
+                        arcpy.AddWarning("Przerwano przez użytkownika.")
+                        break
 
-        arcpy.AddMessage(f"Dodano {len(processed_ids) - initial_count} nowych obiektów.")
+                    arcpy.SetProgressorLabel(f"Pobieranie z ULDK [{idx}/{total_queries}]: {item_label}")
+                    full_extent = self.fetch_and_insert(url, cursor, processed_ids, full_extent, sr_2180, typ_obiektu, errors, item_label)
+                    current_step += 1
+                    arcpy.SetProgressorPosition(current_step)
+        except ToolCancelled:
+            arcpy.AddWarning("Przerwano przez użytkownika.")
+
+        added_count = len(processed_ids) - initial_count
+        messages.addMessage(f"Dodano {added_count} nowych obiektów.")
 
         if len(p) > 12:
             p[12].value = out_fc
@@ -408,30 +440,42 @@ class PobierzDzialkeULDKImpl(object):
         arcpy.ResetProgressor()
 
         if errors:
-            arcpy.AddWarning(f"--- Raport błędów i ostrzeżeń ({len(errors)}) ---")
+            messages.addWarningMessage(f"--- Raport błędów i ostrzeżeń ({len(errors)}) ---")
             for err in errors:
-                arcpy.AddWarning(f"  • {err}")
+                messages.addWarningMessage(f"  • {err}")
 
-        arcpy.AddMessage("Zakończono pomyślnie!")
+        if added_count == 0:
+            arcpy.AddError("Nie pobrano żadnych obiektów. Sprawdź poprawność wprowadzonych numerów lub obrębów.")
+        else:
+            messages.addMessage("Zakończono pomyślnie!")
 
-    def fetch_and_insert(self, req_url, cursor, processed_ids, extent, sr_2180, typ_obiektu, errors):
+    def fetch_and_insert(self, req_url, cursor, processed_ids, extent, sr_2180, typ_obiektu, errors, item_label="obiekt"):
         try:
             resp_text = HttpClient.fetch_text(req_url, timeout=30)
+        except ToolCancelled:
+            raise
         except Exception as e:
-            errors.append(f"Błąd połączenia ({req_url}): {e}")
+            errors.append(f"Błąd połączenia dla obiektu '{item_label}': {e}")
             return extent
 
         lines = [line.strip() for line in resp_text.split('\n') if line.strip()]
         if not lines:
+            errors.append(f"Pusta odpowiedź serwera dla obiektu '{item_label}'.")
             return extent
 
         status = lines[0].strip()
         if status != "0":
-            err_details = " ".join(lines[1:]) if len(lines) > 1 else ""
-            errors.append(f"ULDK ({status}): {err_details} | URL: {req_url}")
+            hint = ""
+            if "," in item_label:
+                hint = " (uwaga: wykryto przecinek w numerze – użyj ukośnika '/', np. 12/3)"
+            elif "-" in item_label:
+                hint = " (uwaga: wykryto myślnik – sprawdź poprawność formatu)"
+
+            errors.append(f"Nie znaleziono obiektu '{item_label}' w bazie ULDK (brak działki lub błędny numer{hint})")
             return extent
 
         if len(lines) < 2:
+            errors.append(f"Brak geometrii dla obiektu '{item_label}'.")
             return extent
 
         for data_line in lines[1:]:
@@ -472,5 +516,5 @@ class PobierzDzialkeULDKImpl(object):
                     extent.XMax = max(extent.XMax, geom.extent.XMax)
                     extent.YMax = max(extent.YMax, geom.extent.YMax)
             except Exception as e:
-                errors.append(f"Błąd zapisu obiektu {d_id}: {e}")
+                errors.append(f"Błąd zapisu obiektu '{item_label}' ({d_id}): {e}")
         return extent

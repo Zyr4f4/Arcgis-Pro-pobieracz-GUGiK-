@@ -4,7 +4,7 @@ import os
 import re
 import urllib.parse
 import xml.etree.ElementTree as ET
-from src.utils import HttpClient
+from src.utils import HttpClient, ToolCancelled
 
 
 class PobierzSkorowidzEGIBImpl(object):
@@ -127,6 +127,8 @@ class PobierzSkorowidzEGIBImpl(object):
 
         try:
             data = HttpClient.fetch_bytes(url, timeout=45)
+        except ToolCancelled:
+            raise
         except Exception as e:
             errors.append(f"Zapytanie WFS (BBOX: {bbox_param}): {e}")
             return []
@@ -206,7 +208,6 @@ class PobierzSkorowidzEGIBImpl(object):
         out_ws = p[2].valueAsText
         raw_out_name = p[3].valueAsText
 
-        # Zachowanie polskich znaków diakrytycznych
         safe_name = re.sub(r'[^\w]', '_', raw_out_name)
         if safe_name and safe_name[0].isdigit():
             safe_name = "L_" + safe_name
@@ -238,7 +239,6 @@ class PobierzSkorowidzEGIBImpl(object):
 
         arcpy.AddMessage(f"Pobieranie obiektów z WFS EGiB ({type_name})...")
 
-        # Zbieranie geometrii wejściowych i kafelków
         all_work_tiles = []
         with arcpy.da.SearchCursor(in_features, ["SHAPE@"]) as search_cur:
             for row in search_cur:
@@ -267,7 +267,6 @@ class PobierzSkorowidzEGIBImpl(object):
         if total_tiles == 0:
             return arcpy.AddWarning("Brak kafelków do przetworzenia.")
 
-        # Total steps: pobieranie kafli + zapis do bazy + dodanie do mapy
         total_steps = total_tiles + 2
         current_step = 0
         arcpy.SetProgressor("step", f"Odpytywanie WFS EGiB (0/{total_tiles})...", 0, total_steps, 1)
@@ -275,36 +274,42 @@ class PobierzSkorowidzEGIBImpl(object):
         features_to_save = []
         all_attr_keys = set()
 
-        for idx, (bbox, input_geom) in enumerate(all_work_tiles, start=1):
-            arcpy.SetProgressorLabel(f"Odpytywanie WFS EGiB [{idx}/{total_tiles}]...")
-            features = self._get_wfs_features(bbox, type_name, errors)
+        try:
+            for idx, (bbox, input_geom) in enumerate(all_work_tiles, start=1):
+                if HttpClient.is_cancelled():
+                    arcpy.AddWarning("Przerwano przez użytkownika.")
+                    break
 
-            for wkt, attrs in features:
-                try:
-                    poly_geom = arcpy.FromWKT(wkt, sr_2180)
-                    if poly_geom and not poly_geom.disjoint(input_geom):
-                        obj_id = (
-                            attrs.get("ID_DZIALKI") or
-                            attrs.get("IDDZIALKI") or
-                            attrs.get("ID_BUDYNKU") or
-                            attrs.get("IDBUDYNKU") or
-                            attrs.get("GML_ID") or
-                            "Nieznany"
-                        )
+                arcpy.SetProgressorLabel(f"Odpytywanie WFS EGiB [{idx}/{total_tiles}]...")
+                features = self._get_wfs_features(bbox, type_name, errors)
 
-                        if obj_id in processed_ids and obj_id != "Nieznany":
-                            continue
+                for wkt, attrs in features:
+                    try:
+                        poly_geom = arcpy.FromWKT(wkt, sr_2180)
+                        if poly_geom and not poly_geom.disjoint(input_geom):
+                            obj_id = (
+                                attrs.get("ID_DZIALKI") or
+                                attrs.get("IDDZIALKI") or
+                                attrs.get("ID_BUDYNKU") or
+                                attrs.get("IDBUDYNKU") or
+                                attrs.get("GML_ID") or
+                                "Nieznany"
+                            )
 
-                        processed_ids.add(obj_id)
-                        all_attr_keys.update(attrs.keys())
-                        features_to_save.append((poly_geom, obj_id, attrs))
-                except Exception as ge:
-                    errors.append(f"Geometria WKT obiektu: {ge}")
+                            if obj_id in processed_ids and obj_id != "Nieznany":
+                                continue
 
-            current_step += 1
-            arcpy.SetProgressorPosition(current_step)
+                            processed_ids.add(obj_id)
+                            all_attr_keys.update(attrs.keys())
+                            features_to_save.append((poly_geom, obj_id, attrs))
+                    except Exception as ge:
+                        errors.append(f"Geometria WKT obiektu: {ge}")
 
-        # Zapis do geobazy
+                current_step += 1
+                arcpy.SetProgressorPosition(current_step)
+        except ToolCancelled:
+            arcpy.AddWarning("Przerwano przez użytkownika.")
+
         current_step += 1
         arcpy.SetProgressorLabel(f"Zapisywanie {len(features_to_save)} obiektów do geobazy...")
         arcpy.SetProgressorPosition(current_step)
@@ -332,7 +337,6 @@ class PobierzSkorowidzEGIBImpl(object):
         if len(p) > 5:
             p[5].value = out_fc
 
-            # Dodanie do aktywnej mapy
             current_step += 1
             arcpy.SetProgressorLabel("Aktualizacja widoku mapy...")
             arcpy.SetProgressorPosition(current_step)

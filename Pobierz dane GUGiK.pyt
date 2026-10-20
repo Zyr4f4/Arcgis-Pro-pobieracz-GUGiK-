@@ -15,16 +15,18 @@ class Toolbox(object):
             # EGiB
             PobierzDzialkeULDK,
             PobierzSkorowidzEGIB,
-            # KINA
+            # Adresy
             PobierzPunktyAdresoweKINA,
             PobierzUliceKINA,
+            GeokodowanieAdresuUUG,
             # Dane fotogrametryczne
             PobierzOrtofotomape,
             PobierzChmuryPunktow,
             PobierzNMTNMPT,
             # Paczki danych
             PobierzBDOT10k,
-            PobierzArchiwalnyBDOT10k
+            PobierzArchiwalnyBDOT10k,
+            PobierzRCN
         ]
 
 
@@ -80,19 +82,19 @@ class PobierzSkorowidzEGIB(object):
 
 
 # ==============================================================================
-# FOLDER: Krajowa Integracja Numeracji Adresowej (KINA)
+# FOLDER: Adresy
 # ==============================================================================
 class PobierzPunktyAdresoweKINA(object):
     def __init__(self):
-        self.label = "Pobierz punkty adresowe"
+        self.label = "Pobierz punkty adresowe (KINA)"
         self.description = "Pobiera punkty numeracji adresowej z usługi WFS Krajowej Integracji Numeracji Adresowej z automatycznym kafelkowaniem."
-        self.category = "Krajowa Integracja Numeracji Adresowej"
+        self.category = "Adresy"
         self.canRunInBackground = False
         self._impl = None
 
     def _get_impl(self):
         if self._impl is None:
-            from src.kina.punkty import PobierzPunktyAdresoweKINAImpl
+            from src.adresy.punkty import PobierzPunktyAdresoweKINAImpl
             self._impl = PobierzPunktyAdresoweKINAImpl()
         return self._impl
 
@@ -108,16 +110,40 @@ class PobierzPunktyAdresoweKINA(object):
 
 class PobierzUliceKINA(object):
     def __init__(self):
-        self.label = "Pobierz osie ulic"
+        self.label = "Pobierz osie ulic (KINA)"
         self.description = "Pobiera geometrie osi ulic i placów z usługi WFS Krajowej Integracji Numeracji Adresowej z automatycznym kafelkowaniem."
-        self.category = "Krajowa Integracja Numeracji Adresowej"
+        self.category = "Adresy"
         self.canRunInBackground = False
         self._impl = None
 
     def _get_impl(self):
         if self._impl is None:
-            from src.kina.ulice import PobierzUliceKINAImpl
+            from src.adresy.ulice import PobierzUliceKINAImpl
             self._impl = PobierzUliceKINAImpl()
+        return self._impl
+
+    def getParameterInfo(self):
+        return self._get_impl().getParameterInfo()
+
+    def updateParameters(self, parameters):
+        return self._get_impl().updateParameters(parameters)
+
+    def execute(self, parameters, messages):
+        return self._get_impl().execute(parameters, messages)
+
+
+class GeokodowanieAdresuUUG(object):
+    def __init__(self):
+        self.label = "Geokodowanie adresów (UUG)"
+        self.description = "Wyszukuje i lokalizuje adresy z tabeli (osobne kolumny: miejscowość, ulica, numer) za pomocą Uniwersalnej Usługi Geokodowania GUGiK."
+        self.category = "Adresy"
+        self.canRunInBackground = False
+        self._impl = None
+
+    def _get_impl(self):
+        if self._impl is None:
+            from src.adresy.geokodowanie import GeokodowanieAdresuUUGImpl
+            self._impl = GeokodowanieAdresuUUGImpl()
         return self._impl
 
     def getParameterInfo(self):
@@ -254,3 +280,27 @@ class PobierzArchiwalnyBDOT10k(object):
 
     def execute(self, parameters, messages):
         return self._get_impl().execute(parameters, messages)
+
+
+class PobierzRCN(object):
+    def __init__(self):
+        self.label = "Pobierz dane z Rejestru Cen Nieruchomości (RCN)"
+        self.description = "Pobiera dane o transakcjach na rynku nieruchomości (działki, lokale, budynki) z usługi WFS Rejestru Cen Nieruchomości GUGiK."
+        self.category = "Paczki danych"
+        self.canRunInBackground = False
+        self._impl = None
+
+    def _get_impl(self):
+        if self._impl is None:
+            from src.paczki.rcn import PobierzRCNImpl
+            self._impl = PobierzRCNImpl()
+        return self._impl
+
+    def getParameterInfo(self):
+        return self._get_impl().getParameterInfo()
+
+    def updateParameters(self, parameters):
+        return self._get_impl().updateParameters(parameters)
+
+    def execute(self, parameters, messages):
+        return self._get_impl().execute(parameters, messages)
